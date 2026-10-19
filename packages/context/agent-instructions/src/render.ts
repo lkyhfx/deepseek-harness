@@ -274,7 +274,7 @@ function changedSectionText(item: ChangeRenderItem): string {
 export function renderInstructionChanges(
   items: ChangeRenderItem[],
   maxBytes: number,
-): { text: string; changes: AgentInstructionChange[]; truncatedPaths: string[] } {
+): { text: string; changes: AgentInstructionChange[]; omittedPaths: string[]; truncatedPaths: string[] } {
   const byAbsolutePath = new Map(items.map(item => [item.file.absolutePath, item]))
   const style: RenderStyle = {
     intro: '',
@@ -286,12 +286,21 @@ export function renderInstructionChanges(
   }
   const rendered = renderInstructionContext(items.map(item => item.file), maxBytes, style)
   const represented = new Set(rendered.represented.map(file => file.absolutePath))
+  const truncatedPaths = rendered.truncated
+    .filter(entry => entry.includedBytes < entry.originalBytes)
+    .map(entry => entry.displayPath)
+  const incomplete = new Set(truncatedPaths)
   return {
     text: rendered.text,
+    // A represented prefix is not proof that all of the file's rules reached
+    // the model. An absent digest persists incomplete delivery across steps.
     changes: items
       .filter(item => represented.has(item.file.absolutePath))
-      .map(item => item.change),
-    truncatedPaths: rendered.truncated.map(entry => entry.displayPath),
+      .map(({ change }) => incomplete.has(change.path)
+        ? { action: change.action, scope: change.scope, path: change.path }
+        : change),
+    omittedPaths: rendered.omitted.map(file => file.displayPath),
+    truncatedPaths,
   }
 }
 

@@ -171,7 +171,10 @@ function visibleInstructionChanges(
  * @param files - baseline files that survived rendering.
  * @returns latest baseline changes and provider versions keyed by logical scope.
  */
-export function baselineInstructionState(files: LoadedInstructionFile[]): {
+export function baselineInstructionState(
+  files: LoadedInstructionFile[],
+  incompletePaths: ReadonlySet<string> = new Set(),
+): {
   changes: Map<string, AgentInstructionChange>
   versions: Map<string, InstructionVersionState>
 } {
@@ -183,7 +186,7 @@ export function baselineInstructionState(files: LoadedInstructionFile[]): {
       action: 'set',
       scope: instructionScopeKey(file.displayPath),
       path: file.displayPath,
-      digest,
+      ...incompletePaths.has(file.displayPath) ? {} : { digest },
     }
     changes.set(change.scope, change)
     if (file.version !== undefined) {
@@ -295,6 +298,8 @@ export async function reconcileInstructionContext(
     scopeMessages: readonly UserMessage[]
     touchedPaths: readonly string[]
     includeBaselineScopes: boolean
+    /** Restrict the guard to the target's applicable instruction chain. */
+    applicableScopesOnly?: boolean
     excludedBaselineScopes?: ReadonlySet<string>
     projectRoot?: string
     signal?: AbortSignal
@@ -331,6 +336,7 @@ export async function reconcileInstructionContext(
     }
   }
   for (const scope of effective.keys()) {
+    if (options.applicableScopesOnly) continue
     if (!options.includeBaselineScopes && baselineScopes.has(scope)) continue
     const { directory } = decodeScopeKey(scope)
     if (isUserGlobalDirectory(directory)) scopes.add(candidateScopeKey(directory, USER_GLOBAL_FILE))
@@ -402,7 +408,7 @@ export async function reconcileInstructionContext(
     const versionUpdateStart = versionUpdates.length
     const priorVersions = new Map(probedScopes.map(scope => [scope, versions.get(scope)]))
     const groupPaths: string[] = []
-    const groupVersions = new Map<string, InstructionVersionState>()
+    const confirmedScopes = new Set<string>()
     // Metadata and content availability apply to the whole deduplicated group,
     // including hidden candidates that may become visible after a sibling edit.
     const rollbackGroup = (): void => {
@@ -446,16 +452,26 @@ export async function reconcileInstructionContext(
           && previous.path === cached.path
           && previous.digest === cached.digest
         if (rendered) {
-          groupVersions.set(scope, cached)
+          confirmedScopes.add(scope)
           // Unchanged and previously rendered: keep it, but an earlier group member
           // that now matches its trimmed content makes this the duplicate to remove.
           if (registerKeptTrimmed(group, cached.trimmedDigest)) pushRemoval(scope, previous.path, cached)
           continue
         }
+        // An absent digest means the previous message held only a prefix.
+        // Suppress duplicate prefixes without certifying them for file edits.
+        if (previous !== undefined && previous.action !== 'remove'
+          && previous.path === cached.path && previous.digest === undefined) {
+          registerKeptTrimmed(group, cached.trimmedDigest)
+          continue
+        }
         // Hidden duplicates include files removed from visible state after
         // becoming duplicates. Only promotion requires another content read.
         if ((previous === undefined || previous.action === 'remove')
-          && hasKeptTrimmed(group, cached.trimmedDigest)) continue
+          && hasKeptTrimmed(group, cached.trimmedDigest)) {
+          confirmedScopes.add(scope)
+          continue
+        }
       }
 
       const file = await readScopeInstruction(probedFile, resolved.maxSourceBytes, fileSystem, options.signal)
@@ -472,6 +488,8 @@ export async function reconcileInstructionContext(
         trimmedDigest,
       }
       if (registerKeptTrimmed(group, trimmedDigest)) {
+        // The earlier candidate already supplied byte-identical content.
+        confirmedScopes.add(scope)
         // A distinct file whose trimmed content already appeared earlier in this
         // group: drop it, removing any copy that was previously rendered, and keep
         // its metadata so the next pass decides without reading it again.
@@ -484,7 +502,7 @@ export async function reconcileInstructionContext(
       }
       if (previous !== undefined && previous.action !== 'remove' && previous.path === file.displayPath && previous.digest === currentDigest) {
         versions.set(scope, nextVersion)
-        groupVersions.set(scope, nextVersion)
+        confirmedScopes.add(scope)
         continue
       }
       const action = previous === undefined || previous.action === 'remove' ? 'set' : 'replace'
@@ -507,29 +525,27 @@ export async function reconcileInstructionContext(
     // Nothing rendered: the provider could not settle the group, or the byte
     // budget or deduplication dropped the candidates. Confirmation is per
     // candidate, so one settled file never vouches for an unread sibling.
-    const pending = groupPaths.filter((path) => {
-      const scope = instructionScopeKey(path)
-      const state = groupVersions.get(scope)
-      const previous = delivered.get(scope)
-      return state === undefined || previous === undefined || previous.action === 'remove'
-    })
+    const pending = groupPaths.filter(path => !confirmedScopes.has(instructionScopeKey(path)))
     if (pending.length > 0) unconfirmed.push({ changes: [], paths: pending })
   }
   if (items.length === 0) return { versionUpdates: [], unconfirmed }
   const rendered = renderInstructionChanges(items, resolved.maxBytes)
-  // A truncated file delivered only part of its prose, so the model cannot be
-  // shown to hold its complete requirements even though it received a heading
-  // and some content. Only a complete delivery settles a strict pre-edit check.
-  if (rendered.truncatedPaths.length > 0) {
-    unconfirmed.push({ changes: [], paths: rendered.truncatedPaths })
-  }
+  // Neither omitted instructions nor partial prefixes certify complete delivery.
+  // Keep both paths unconfirmed even when other changes fit the same batch.
+  const incompletePaths = [...rendered.omittedPaths, ...rendered.truncatedPaths]
+  if (incompletePaths.length > 0) unconfirmed.push({ changes: [], paths: incompletePaths })
   // When no transition survived rendering (tiny budgets render notice-only
   // text), emit nothing and commit nothing — the uncommitted versions make the
   // next pass retry instead of spamming notice-only contexts.
   if (rendered.text.length === 0 || rendered.changes.length === 0) return { versionUpdates: [], unconfirmed }
   return {
     context: agentInstructionsHook(rendered.text, rendered.changes),
-    versionUpdates: retainedInstructionVersionUpdates(versionUpdates, rendered.changes),
+    versionUpdates: retainedInstructionVersionUpdates(
+      versionUpdates.map(update => rendered.truncatedPaths.includes(update.change.path)
+        ? { ...update, change: { action: update.change.action, scope: update.change.scope, path: update.change.path } }
+        : update),
+      rendered.changes,
+    ),
     unconfirmed,
   }
 }

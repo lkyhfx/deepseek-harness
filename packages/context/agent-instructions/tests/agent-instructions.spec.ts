@@ -6281,6 +6281,10 @@ describe('pre-edit protection', () => {
       })
       expect(first.isError).toBe(true)
       expect(blocksText(first.content)).toContain('cannot confirm the workspace instructions')
+      const partialContext = first.additionalContexts?.find(message => message.source.kind === 'agent-instructions')
+      expect(partialContext?.source.kind === 'agent-instructions'
+        ? partialContext.source.changes[0]?.digest
+        : undefined).toBeUndefined()
 
       // Entering the truncated text does not settle the file: the model never
       // saw the tail, so the repeat stays held too.
@@ -6297,6 +6301,109 @@ describe('pre-edit protection', () => {
       })
       expect(second.isError).toBe(true)
       expect(blocksText(second.content)).toContain('cannot confirm the workspace instructions')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+
+  it('denies writes under an incomplete root baseline, including repeated attempts', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'src'), { recursive: true })
+      await write(join(root, 'AGENTS.md'), `opening rule\n${'padding rule\n'.repeat(200)}must run ttsc-graph before editing`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const baseline = baselineEvents(agent).at(-1)
+      const changes = baseline?.type === 'user/message'
+        && baseline.data.source.kind === 'agent-instructions'
+        ? baseline.data.source.changes : []
+      expect(changes).toEqual([{
+        action: 'set',
+        scope: sk('.', 'AGENTS.md'),
+        path: 'AGENTS.md',
+      }])
+
+      for (const attempt of ['first', 'second']) {
+        const result = await ctx.tools.execute({
+          signal: testToolSignal,
+          callId: ToolCallId(`write-under-truncated-root-${attempt}`),
+          name: 'write',
+          arguments: { file_path: join(root, 'src', 'out.txt'), content: 'x' },
+          agent,
+        })
+        expect(result.isError).toBe(true)
+        expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+        expect(existsSync(join(root, 'src', 'out.txt'))).toBe(false)
+      }
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts an unrelated sibling write without requiring cwd-only rules', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'apps', 'web'), { recursive: true })
+      await write(join(root, 'apps', 'api', 'AGENTS.md'), `api prefix\n${'api rule\n'.repeat(200)}`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(join(root, 'apps', 'api'))
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-unrelated-sibling'),
+        name: 'write',
+        arguments: { file_path: join(root, 'apps', 'web', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts byte-identical baseline candidates without requiring duplicate delivery', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'src'), { recursive: true })
+      await write(join(root, 'AGENTS.md'), 'same instructions')
+      await write(join(root, 'CLAUDE.md'), 'same instructions')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-with-duplicate-baseline'),
+        name: 'write',
+        arguments: { file_path: join(root, 'src', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
     } finally {
       vi.unstubAllEnvs()
       await rm(root, { recursive: true, force: true })

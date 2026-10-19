@@ -234,7 +234,10 @@ export function apply(ctx: Context, config: Config): void {
         replacePreviousBaseline,
         signal,
       }, fileSystem)
-      const baseline = baselineInstructionState(instructions?.included ?? [])
+      const incompleteBaseline = new Set(instructions?.rendered.truncated
+        .filter(entry => entry.includedBytes < entry.originalBytes)
+        .map(entry => entry.displayPath) ?? [])
+      const baseline = baselineInstructionState(instructions?.included ?? [], incompleteBaseline)
       const observedBaseline = baselineInstructionState(instructions?.observed ?? [])
       const includedDigestsByGroup = new Map<string, Set<string>>()
       for (const file of instructions?.included ?? []) {
@@ -404,23 +407,24 @@ export function apply(ctx: Context, config: Config): void {
     const fileSystem = ctx.get('fs')
     if (fileSystem === undefined) return undefined
     const cwd = await ctx.workingDirectory.ensure(agent, signal)
-    let projectRoot: string
+    const targetDir = dirname(resolve(cwd, filePath))
     let reconciliation: InstructionReconciliation
     try {
-      projectRoot = await findProjectRoot(cwd, resolved.projectRootMarkers, fileSystem, signal)
-      // The baseline chain is loaded before the first request, so only the
-      // scopes this write's own directory adds can still be missing.
+      const projectRoot = await findProjectRoot(targetDir, resolved.projectRootMarkers, fileSystem, signal)
+      // Recheck the target's full applicable chain, including the baseline.
+      // Rules from an unrelated working-directory subtree are not applicable.
       reconciliation = await reconcileInstructionContext(
         agent,
         resolved,
         instructionVersions,
         fileSystem,
         {
-          cwd,
+          cwd: targetDir,
           authorityMessages: [],
           scopeMessages: [],
-          touchedPaths: [filePath],
-          includeBaselineScopes: false,
+          touchedPaths: [],
+          includeBaselineScopes: true,
+          applicableScopesOnly: true,
           projectRoot,
           signal,
         },
