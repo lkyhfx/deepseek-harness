@@ -67,7 +67,7 @@ export interface Config {
 | `projectRootMarkers` | `['.git']` | 标记项目根目录的目录名 |
 | `instructionFileCandidates` | `['AGENTS.md', 'CLAUDE.md']` | 每个项目目录中加载的基础文件名 |
 | `localInstructionFileCandidates` | `['AGENTS.local.md', 'CLAUDE.local.md']` | 在基础文件之后加载的本地 overlay 文件名 |
-| `preEditProtection` | `true` | 结构化 `write` 或 `edit` 的适用指令尚未送达模型时拦下该调用，并在拒绝结果上附带这些指令 |
+| `preEditProtection` | `true` | 结构化 `write` 或 `edit` 的适用指令尚未送达模型时拦下该调用，并在拒绝结果上附带这些指令。适用作用域取自目标文件自身的目录链（含工作目录的兄弟目录）；Provider 失败、指令文件不可读或被字节预算丢弃的内容都会拦下调用，而不是放行 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-agent-instructions)是每个受支持字段及其 JSDoc 的穷尽式真源。
 

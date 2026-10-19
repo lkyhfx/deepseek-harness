@@ -2280,19 +2280,19 @@ describe('workspace context request injection', () => {
       }
       fs.throwOnStat.add(sharedPath)
 
-      expect(await reconcileInstructionContext(agent, resolved, cache, fs, options)).toBeUndefined()
+      expect((await reconcileInstructionContext(agent, resolved, cache, fs, options)).context).toBeUndefined()
       expect(cache.get(agent.session)?.size ?? 0).toBe(0)
 
       fs.throwOnStat.delete(sharedPath)
       const recovered = await reconcileInstructionContext(agent, resolved, cache, fs, options)
-      expect(recovered?.context.source).toMatchObject({
+      expect(recovered.context?.source).toMatchObject({
         kind: 'agent-instructions',
         changes: [
           { action: 'replace', scope: sk(USER_GLOBAL_DIRECTORY, USER_GLOBAL_FILE), path: '$DSH_HOME/AGENTS.md' },
           { action: 'set', scope: sk(AGENTS_GLOBAL_DIRECTORY, USER_GLOBAL_FILE), path: '$DSH_AGENTS_HOME/AGENTS.md' },
         ],
       })
-      expect(blocksText(recovered?.context.content)).toContain('These user-global instructions apply to all work.')
+      expect(blocksText(recovered.context?.content)).toContain('These user-global instructions apply to all work.')
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4299,7 +4299,7 @@ describe('dynamic nested workspace context injection', () => {
           const warm = await reconcileInstructionContext(agent, resolved, warmCache, fs, options)
 
           expect(cold).toEqual(warm)
-          expect(cold).toBeUndefined()
+          expect(cold.context).toBeUndefined()
         }
       } finally {
         vi.unstubAllEnvs()
@@ -4350,7 +4350,7 @@ describe('dynamic nested workspace context injection', () => {
 
       const result = await reconcileInstructionContext(agent, resolved, cache, fs, options)
 
-      expect(result).toBeUndefined()
+      expect(result.context).toBeUndefined()
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4394,7 +4394,7 @@ describe('dynamic nested workspace context injection', () => {
         signal: testToolSignal,
       })
 
-      expect(result).toBeUndefined()
+      expect(result.context).toBeUndefined()
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4429,7 +4429,7 @@ describe('dynamic nested workspace context injection', () => {
         signal: testToolSignal,
       })
 
-      expect(result?.context.source).toMatchObject({
+      expect(result.context?.source).toMatchObject({
         changes: [{ action: 'set', scope: sk(USER_GLOBAL_DIRECTORY, USER_GLOBAL_FILE) }],
       })
     } finally {
@@ -5942,6 +5942,29 @@ describe('workspace instructions protocol section', () => {
     await expect(mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })).resolves.toBeDefined()
   })
 
+  it('registers the protocol when the system-prompt service arrives after the plugin', async () => {
+    const ctx = new Context()
+    const plugin = await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    await ctx.plugin(SystemPrompt)
+
+    const assembly = await ctx.systemPrompt.assemble()
+    expect(assembly.sections.find(candidate => candidate.name === AgentInstructions.WORKSPACE_PROTOCOL_SECTION)?.text)
+      .toContain('# Workspace Instructions Protocol')
+
+    await plugin.dispose()
+    const withdrawn = await ctx.systemPrompt.assemble()
+    expect(withdrawn.sections.find(candidate => candidate.name === AgentInstructions.WORKSPACE_PROTOCOL_SECTION)).toBeUndefined()
+  })
+
+  it('withdraws the protocol when the system-prompt service unloads first', async () => {
+    const ctx = new Context()
+    const prompt = await ctx.plugin(SystemPrompt)
+    await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    await prompt.dispose()
+
+    await expect(mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })).resolves.toBeDefined()
+  })
+
   it('keeps the protocol out of the persona slot so a complete persona still wins', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
@@ -6068,6 +6091,158 @@ describe('pre-edit protection', () => {
       })
       expect(edit.isError).toBe(true)
       expect(blocksText(edit.content)).toContain('workspace instructions must be loaded before modifying this file')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write whose instructions live in a sibling of the cwd', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'apps/web/AGENTS.md'), 'sibling-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(join(root, 'apps', 'api'))
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-sibling'),
+        name: 'write',
+        arguments: { file_path: join(root, 'apps', 'web', 'index.ts'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('apps/web/AGENTS.md')
+      const pending = result.additionalContexts?.find(message => message.source.kind === 'agent-instructions')
+      expect(blocksText(pending?.content)).toContain('sibling-only rule')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write outside the project root instead of assuming no instructions apply', async () => {
+    const root = await tempRepo()
+    const outside = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(outside, 'AGENTS.md'), 'outside rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-outside'),
+        name: 'write',
+        arguments: { file_path: join(outside, 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('workspace instructions must be loaded before modifying this file')
+      expect(blocksText(result.content)).toContain('AGENTS.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write when the applicable instruction file cannot be read', async () => {
+    const root = join(await tempRepo(), 'virtual-repo')
+    const home = join(await tempRepo(), 'virtual-home')
+    const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
+    pinHarnessHome(home)
+    try {
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(RecordingFileSystem)
+      const fs = ctx.fs as RecordingFileSystem
+      fs.entries.set(join(root, '.git'), { type: 'directory' })
+      fs.entries.set(join(root, 'pkg/AGENTS.md'), { type: 'file', content: 'unreadable rule' })
+      fs.throwOnStat.add(join(root, 'pkg/AGENTS.md'))
+      await ctx.plugin(ToolFs)
+      await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-unreadable'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+      expect(blocksText(result.content)).toContain('pkg/AGENTS.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await ctx.fiber.dispose()
+      await rm(dirname(root), { recursive: true, force: true })
+      await rm(dirname(home), { recursive: true, force: true })
+    }
+  })
+
+  it('runs downstream post-execute policies before adding ferried instructions', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), 'package-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+      let observed = 0
+      ctx.on('tools/post-execute', async (_exec, _result, _next) => {
+        observed += 1
+        return {
+          kind: 'block',
+          feedback: [{ type: 'text', text: 'downstream policy refused the result' }],
+          additionalContexts: [createUserMessage({
+            content: [{ type: 'text', text: 'downstream context' }],
+            source: { kind: 'other' },
+          })],
+        }
+      })
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-before-policy'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      // The held write reaches post-execute, where the downstream policy decides
+      // the outcome; the ferried instructions join its context instead of
+      // replacing the decision with an unconditional accept.
+      expect(observed).toBe(1)
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('downstream policy refused the result')
+      const texts = (result.additionalContexts ?? []).map(message => blocksText(message.content))
+      expect(texts).toContain('downstream context')
+      expect(texts.join('\n')).toContain('package-only rule')
     } finally {
       vi.unstubAllEnvs()
       await rm(root, { recursive: true, force: true })

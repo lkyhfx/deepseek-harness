@@ -67,7 +67,7 @@ export interface Config {
 | `projectRootMarkers` | `['.git']` | Directory names that mark the project root |
 | `instructionFileCandidates` | `['AGENTS.md', 'CLAUDE.md']` | Base file names loaded in each project directory |
 | `localInstructionFileCandidates` | `['AGENTS.local.md', 'CLAUDE.local.md']` | Local overlay file names loaded after the base files |
-| `preEditProtection` | `true` | Hold back a structured `write` or `edit` whose applicable instructions the model has not received yet, ferrying them on the refusal |
+| `preEditProtection` | `true` | Hold back a structured `write` or `edit` whose applicable instructions the model has not received yet, ferrying them on the refusal. The scopes come from the target file's own directory chain, including siblings of the working directory; a provider failure, an unreadable instruction file, or content the byte budget dropped holds the call instead of proceeding |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-agent-instructions) is the exhaustive source for every accepted field and its JSDoc.
 

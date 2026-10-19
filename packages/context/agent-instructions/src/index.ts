@@ -12,6 +12,7 @@
 import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
 import { isDeepStrictEqual } from 'node:util'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, UserMessage } from '@deepseek-ai/dsh-session'
@@ -34,7 +35,7 @@ import {
   agentInstructionsMessage,
   type InstructionVersionCache,
   type AgentInstructionSource,
-  type ReconciledInstructionContext,
+  type InstructionReconciliation,
 } from './state.ts'
 import { instructionCandidateGroup, instructionScopeKey, scopeForDisplayPath, type AgentInstructionChange } from './render.ts'
 import { WORKSPACE_INSTRUCTIONS_PROTOCOL, WORKSPACE_PROTOCOL_SECTION } from './protocol.ts'
@@ -118,21 +119,49 @@ function preEditDenialReason(paths: readonly string[]): string {
     + 'They are injected as the next message. Read them and repeat this modification, adjusting it to satisfy those instructions.'
 }
 
+/**
+ * Explain a held-back write whose instruction files could not be confirmed.
+ * @param filePath - the held target file.
+ * @param paths - display paths of the instruction candidates that could not be settled.
+ * @returns the model-facing denial reason.
+ */
+function preEditUnconfirmedReason(filePath: string, paths: readonly string[]): string {
+  const listed = paths.length > 0 ? paths.map(path => `\`${path}\``).join(', ') : 'its workspace instructions'
+  return `cannot confirm the workspace instructions that apply to \`${filePath}\`: ${listed} could not be read or encoded. `
+    + 'Strict pre-edit protection refuses the modification until they can be read. '
+    + 'Report the unreadable instruction state instead of retrying, or ask the operator to restore readability.'
+}
+
+/**
+ * Name the instruction candidates that govern a filesystem directory.
+ * @param directory - absolute directory whose candidates apply.
+ * @param resolved - normalized plugin configuration.
+ * @returns absolute candidate paths.
+ */
+function describeProjectInstructionTargets(
+  directory: string,
+  resolved: ResolvedConfig,
+): string[] {
+  if (!isAbsolute(directory)) return [directory]
+  return [...resolved.instructionFileCandidates, ...resolved.localInstructionFileCandidates]
+    .map(candidate => join(directory, candidate))
+}
+
 export function apply(ctx: Context, config: Config): void {
   const resolved: ResolvedConfig = resolveConfig(config)
   // Registered as one named first-party section rather than folded into the
   // system prompt wholesale, so persona, tool guidance, and per-agent scoped
-  // overrides keep their own slots. The optional read keeps a providerless
-  // composition loading without the section.
-  const systemPrompt = ctx.get('systemPrompt')
-  if (systemPrompt !== undefined) {
-    systemPrompt.section({
+  // overlays keep their own slots. Injection is reactive: the section appears
+  // when the service becomes available and is withdrawn with it, so plugin
+  // activation order does not decide whether the protocol reaches the model.
+  ctx.inject(['systemPrompt'], (scope: Context) => {
+    scope.systemPrompt.section({
       name: WORKSPACE_PROTOCOL_SECTION,
-      order: systemPrompt.getSectionOrder('WORKSPACE_INSTRUCTIONS_PROTOCOL'),
+      order: scope.systemPrompt.getSectionOrder('WORKSPACE_INSTRUCTIONS_PROTOCOL'),
       text: WORKSPACE_INSTRUCTIONS_PROTOCOL,
       interpolate: false,
     })
-  }
+  })
   const instructionVersions: InstructionVersionCache = new WeakMap()
   const baselinePreparations = new WeakMap<Session, {
     identity: string
@@ -141,14 +170,14 @@ export function apply(ctx: Context, config: Config): void {
   const projectionLifecycle = new AbortController()
   type ProjectionTouch = { agent: Agent; path: string }
   const executionTouches = new Map<ToolExecutionToken, ProjectionTouch[]>()
-  // Pending instructions for a write held back by pre-edit protection, keyed by
-  // the refused call's execution token. Entry lifetime is one execution.
-  const guardedInstructions = new Map<ToolExecutionToken, UserMessage>()
+  // Instructions to ferry on a write held back by pre-edit protection. Keyed by
+  // the held agent, not the call: a deny never dispatches, so no token-keyed
+  // post-execute follow-up exists. Each entry serves the agent's next result.
+  const guardedInstructions = new WeakMap<Agent, UserMessage>()
   ctx.effect(
     () => () => {
       projectionLifecycle.abort(new Error('agent-instructions disposed'))
       executionTouches.clear()
-      guardedInstructions.clear()
     },
     'agent-instructions.projectionLifecycle',
   )
@@ -273,7 +302,7 @@ export function apply(ctx: Context, config: Config): void {
         signal,
       },
     )
-    if (update !== undefined) {
+    if (update.context !== undefined) {
       content.push(...update.context.content)
       /* v8 ignore next -- reconciliation constructs only agent-instructions contexts. */
       if (update.context.source.kind === 'agent-instructions') {
@@ -355,32 +384,31 @@ export function apply(ctx: Context, config: Config): void {
   }
 
   /**
-   * Refuse a structured write whose applicable workspace instructions the model
-   * has not received yet, and ferry those instructions on the refusal.
+   * Resolve the scopes a write's target directory adds and confirm whether their
+   * instructions reached the model, ferrying any that did not.
    *
-   * Only a call whose target path is readable from `arguments` is checked, so
-   * an unrecognized tool is never guessed at and arguments are never rewritten.
-   * Unavailable instruction state never refuses a call: a provider failure or
-   * an unknown project root must not strand a write the model may perform.
-   * @param exec - pending tool execution.
+   * A confirmed absence and a delivered file both proceed. An unreadable
+   * provider, an unreadable instruction file, an uncompiled project scope, or a
+   * render budget that dropped the content holds the call: under strict
+   * pre-edit protection an unknown instruction state is never treated as
+   * "no instructions apply".
    * @returns a denial carrying the pending instructions, or undefined to proceed.
    */
-  const holdUninstructedWrite = async (exec: ToolExecution): Promise<PreToolDecision | undefined> => {
-    if (!resolved.preEditProtection) return undefined
-    if (!FILE_WRITE_TOOL_NAMES.has(exec.name)) return undefined
-    const agent = exec.agent
-    const filePath = filePathFromExecution(exec)
-    if (agent === undefined || filePath === undefined) return undefined
+  const inspectWriteInstructions = async (
+    agent: Agent,
+    filePath: string,
+    signal: AbortSignal,
+  ): Promise<PreToolDecision | undefined> => {
     const fileSystem = ctx.get('fs')
     if (fileSystem === undefined) return undefined
-    const cwd = await ctx.workingDirectory.ensure(agent, exec.signal)
+    const cwd = await ctx.workingDirectory.ensure(agent, signal)
     let projectRoot: string
-    let pendingInstructions: ReconciledInstructionContext | undefined
+    let reconciliation: InstructionReconciliation
     try {
-      projectRoot = await findProjectRoot(cwd, resolved.projectRootMarkers, fileSystem, exec.signal)
+      projectRoot = await findProjectRoot(cwd, resolved.projectRootMarkers, fileSystem, signal)
       // The baseline chain is loaded before the first request, so only the
-      // nested scopes this write's directory adds can still be missing.
-      pendingInstructions = await reconcileInstructionContext(
+      // scopes this write's own directory adds can still be missing.
+      reconciliation = await reconcileInstructionContext(
         agent,
         resolved,
         instructionVersions,
@@ -392,22 +420,56 @@ export function apply(ctx: Context, config: Config): void {
           touchedPaths: [filePath],
           includeBaselineScopes: false,
           projectRoot,
-          signal: exec.signal,
+          signal,
         },
       )
     } catch (error: unknown) {
-      if (exec.signal.aborted) throw error
-      return undefined
+      if (signal.aborted) throw error
+      return {
+        kind: 'deny',
+        reason: preEditUnconfirmedReason(filePath, describeProjectInstructionTargets(dirname(resolve(cwd, filePath)), resolved)),
+        info: PRE_EDIT_GUARD_INFO,
+      }
     }
-    if (pendingInstructions === undefined) return undefined
-    // The version cache is deliberately not committed here: the pending
-    // context is not durable until the loop enters it, so a lost ferry leaves
-    // the call held rather than silently allowing the uninstructed write.
-    guardedInstructions.set(exec.token, pendingInstructions.context)
-    const paths = pendingInstructions.context.source.kind === 'agent-instructions'
-      ? pendingInstructions.context.source.changes.map(change => change.path)
-      : []
-    return { kind: 'deny', reason: preEditDenialReason(paths), info: PRE_EDIT_GUARD_INFO }
+    // Only this pass settles a call: baseline scopes are excluded here, so a
+    // scope the model holds from history does not settle a file whose prose
+    // never entered a context.
+    const { context, unconfirmed } = reconciliation
+    // The version cache is deliberately not committed here: a ferried context is
+    // not durable until the loop enters it, so a lost ferry leaves the call
+    // held rather than silently allowing the uninstructed write.
+    if (context !== undefined) guardedInstructions.set(agent, context)
+    if (context === undefined && unconfirmed.length === 0) return undefined
+    if (unconfirmed.length === 0) {
+      // The pending context carries these files to the next result, so the model
+      // receives them before it can repeat the write.
+      const delivered = context?.source.kind === 'agent-instructions'
+        ? context.source.changes.map(change => change.path)
+        : []
+      return { kind: 'deny', reason: preEditDenialReason(delivered), info: PRE_EDIT_GUARD_INFO }
+    }
+    // A scope this pass could not settle: neither a delivery nor history shows
+    // the model its instructions, so the call stays held.
+    const held = [...new Set(unconfirmed.flatMap(entry => entry.paths))]
+    return { kind: 'deny', reason: preEditUnconfirmedReason(filePath, held), info: PRE_EDIT_GUARD_INFO }
+  }
+
+  /**
+   * Hold back a structured write whose applicable workspace instructions the
+   * model has not received yet, and ferry those instructions on the refusal.
+   *
+   * Only a call whose target path is readable from `arguments` is checked, so
+   * an unrecognized tool is never guessed at and arguments are never rewritten.
+   * @param exec - pending tool execution.
+   * @returns a denial carrying the pending instructions, or undefined to proceed.
+   */
+  const holdUninstructedWrite = async (exec: ToolExecution): Promise<PreToolDecision | undefined> => {
+    if (!resolved.preEditProtection) return undefined
+    if (!FILE_WRITE_TOOL_NAMES.has(exec.name)) return undefined
+    const agent = exec.agent
+    const filePath = filePathFromExecution(exec)
+    if (agent === undefined || filePath === undefined) return undefined
+    return await inspectWriteInstructions(agent, filePath, exec.signal)
   }
 
   const stepIsOpen = (session: Session): boolean => {
@@ -477,11 +539,17 @@ export function apply(ctx: Context, config: Config): void {
     return await holdUninstructedWrite(exec) ?? { kind: 'allow' }
   })
 
-  ctx.on('tools/post-execute', (exec: ToolExecution, _result, next): Promise<PostToolDecision> => {
-    const pending = guardedInstructions.get(exec.token)
-    if (pending === undefined) return next()
-    guardedInstructions.delete(exec.token)
-    return Promise.resolve({ kind: 'accept', additionalContexts: [pending] })
+  ctx.on('tools/post-execute', async (exec: ToolExecution, _result, next): Promise<PostToolDecision> => {
+    const agent = exec.agent
+    if (agent === undefined) return await next()
+    const pending = guardedInstructions.get(agent)
+    if (pending === undefined) return await next()
+    guardedInstructions.delete(agent)
+    // Delegate first so downstream policies still decide this result, then
+    // compose: a blocked result keeps its feedback and only gains the context,
+    // while an accepted result never loses a content or value replacement.
+    const decision = await next()
+    return { ...decision, additionalContexts: [...decision.additionalContexts ?? [], pending] }
   })
 
   ctx.on('tools/result', (exec: ToolExecution, result: ToolExecutionResult) => {

@@ -8,6 +8,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Message } from '@deepseek-ai/dsh-llm'
 import type { Session, UserMessage } from '@deepseek-ai/dsh-session'
+import { dirname, isAbsolute, parse, relative, resolve } from 'node:path'
 import type { FileSystem, FsVersion } from '@deepseek-ai/dsh-fs'
 import type { ResolvedConfig } from './config.ts'
 import { instructionContentSha1, trimmedInstructionDigest } from './digest.ts'
@@ -76,12 +77,6 @@ export interface InstructionVersionUpdate {
   state?: InstructionVersionState
 }
 
-/** Rendered reconciliation plus its metadata-cache transitions. */
-export interface ReconciledInstructionContext {
-  context: UserMessage
-  versionUpdates: InstructionVersionUpdate[]
-}
-
 function agentInstructionsHook(text: string, changes: AgentInstructionChange[]): UserMessage {
   return createUserMessage({
     content: [{ type: 'text', text }],
@@ -113,19 +108,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/**
+ * Narrow one persisted instruction change record.
+ * @param value - unvalidated member of a durable context's `changes` array.
+ * @returns the recognized change, or undefined for an unrecognized record.
+ */
+function parseInstructionChange(value: unknown): AgentInstructionChange | undefined {
+  if (!isRecord(value)) return undefined
+  if (value.action !== 'set' && value.action !== 'replace' && value.action !== 'remove') return undefined
+  if (typeof value.scope !== 'string' || typeof value.path !== 'string') return undefined
+  if (value.digest !== undefined && typeof value.digest !== 'string') return undefined
+  return {
+    action: value.action,
+    scope: value.scope,
+    path: value.path,
+    ...value.digest !== undefined ? { digest: value.digest } : {},
+  }
+}
+
 function workspaceInstructionChanges(source: { changes: unknown[] }): AgentInstructionChange[] {
   const changes: AgentInstructionChange[] = []
   for (const value of source.changes) {
-    if (!isRecord(value)) continue
-    if (value.action !== 'set' && value.action !== 'replace' && value.action !== 'remove') continue
-    if (typeof value.scope !== 'string' || typeof value.path !== 'string') continue
-    if (value.digest !== undefined && typeof value.digest !== 'string') continue
-    changes.push({
-      action: value.action,
-      scope: value.scope,
-      path: value.path,
-      ...value.digest !== undefined ? { digest: value.digest } : {},
-    })
+    const change = parseInstructionChange(value)
+    if (change !== undefined) changes.push(change)
   }
   return changes
 }
@@ -137,6 +142,7 @@ function sameInstructionChange(a: AgentInstructionChange, b: AgentInstructionCha
     && a.digest === b.digest
 }
 
+/** Visible instruction changes keyed by scope, folding history then claimed context. */
 function visibleInstructionChanges(
   agent: Agent,
   authorityMessages: readonly UserMessage[],
@@ -234,9 +240,39 @@ export function applyInstructionVersionUpdates(
   if (states.size === 0) cache.delete(session)
 }
 
+function isWithin(root: string, target: string): boolean {
+  const relativePath = relative(root, target)
+  return relativePath.length === 0 || (!relativePath.startsWith('..') && !isAbsolute(relativePath))
+}
+
 function relativeScope(projectRoot: string, dir: string): string {
   const scope = relativeDisplay(projectRoot, dir)
   return scope.length === 0 ? '.' : scope
+}
+
+/**
+ * Scopes whose state a reconciliation could not confirm, either because a
+ * provider probe or read failed or because the byte budget dropped their
+ * content. `changes` holds the instruction transitions already delivered for
+ * the scope, which a caller may hand over again instead of holding.
+ */
+export interface UnconfirmedInstructionState {
+  changes: AgentInstructionChange[]
+  /** Project display paths of files in an unconfirmed scope that were not delivered. */
+  paths: string[]
+}
+
+/** Reconciliation outcome: a model-visible context, unconfirmed scopes, neither, or both. */
+export interface InstructionReconciliation {
+  context?: UserMessage
+  /** Committed cache transitions for the rendered context. */
+  versionUpdates: InstructionVersionUpdate[]
+  /**
+   * Scopes whose applicable instruction files exist but whose state this pass
+   * could not confirm: a failed provider probe or read, or content the byte
+   * budget or deduplication dropped before the model saw it.
+   */
+  unconfirmed: UnconfirmedInstructionState[]
 }
 
 /**
@@ -246,7 +282,7 @@ function relativeScope(projectRoot: string, dir: string): string {
  * @param versionCache - per-session scope metadata used to skip unchanged reads.
  * @param fileSystem - provider used for current file probes.
  * @param options - authoritative claimed context, pending scope hints, touched paths, and baseline participation.
- * @returns rendered context plus deferred cache updates, or undefined when unchanged/unavailable.
+ * @returns rendered context, unconfirmed scopes, or both.
  */
 export async function reconcileInstructionContext(
   agent: Agent,
@@ -263,9 +299,10 @@ export async function reconcileInstructionContext(
     projectRoot?: string
     signal?: AbortSignal
   },
-): Promise<ReconciledInstructionContext | undefined> {
+): Promise<InstructionReconciliation> {
   const session = agent.session
   const effective = visibleInstructionChanges(agent, options.authorityMessages)
+  const delivered = new Map(effective)
   const cwd = options.cwd
   // TODO(frozen-project-root): retain the baseline root for the loop instance;
   // recomputing it after marker edits reinterprets the existing relative scope keys.
@@ -300,7 +337,18 @@ export async function reconcileInstructionContext(
     else addDirScopes(scopes, directory)
   }
   for (const touchedPath of options.touchedPaths) {
-    for (const dir of descendantDirsBetween(cwd, touchedPath)) addProjectScopes(scopes, dir)
+    // A touched path outside the cwd subtree still carries the project chain
+    // from its own directory up to the project root.
+    const descendants = descendantDirsBetween(cwd, touchedPath)
+    if (descendants.length > 0) {
+      for (const dir of descendants) addProjectScopes(scopes, dir)
+      continue
+    }
+    // Outside the project, walk the target's own chain up to the filesystem
+    // root instead of assuming no instructions govern it.
+    const targetDir = dirname(isAbsolute(touchedPath) ? touchedPath : resolve(cwd, touchedPath))
+    const until = isWithin(projectRoot, targetDir) ? projectRoot : parse(targetDir).root
+    for (const dir of ancestorChain(until, targetDir)) addProjectScopes(scopes, dir)
   }
 
   const versions = versionStatesFor(session, versionCache)
@@ -322,6 +370,7 @@ export async function reconcileInstructionContext(
     return false
   }
   const items: ChangeRenderItem[] = []
+  const unconfirmed: UnconfirmedInstructionState[] = []
   const versionUpdates: InstructionVersionUpdate[] = []
   const pushRemoval = (scope: string, path: string, state?: InstructionVersionState): void => {
     const change: AgentInstructionChange = { action: 'remove', scope, path }
@@ -342,7 +391,7 @@ export async function reconcileInstructionContext(
       if (options.excludedBaselineScopes !== undefined
         && baselineScopes.has(scope)
         && options.excludedBaselineScopes.has(scope)) {
-        const previous = effective.get(scope)
+        const previous = delivered.get(scope)
         if (previous === undefined || previous.action === 'remove') versions.delete(scope)
         else pushRemoval(scope, previous.path)
       } else {
@@ -352,6 +401,8 @@ export async function reconcileInstructionContext(
     const itemStart = items.length
     const versionUpdateStart = versionUpdates.length
     const priorVersions = new Map(probedScopes.map(scope => [scope, versions.get(scope)]))
+    const groupPaths: string[] = []
+    const groupVersions = new Map<string, InstructionVersionState>()
     // Metadata and content availability apply to the whole deduplicated group,
     // including hidden candidates that may become visible after a sibling edit.
     const rollbackGroup = (): void => {
@@ -372,6 +423,7 @@ export async function reconcileInstructionContext(
       const previous = effective.get(scope)
       const probe = await probeScopeInstruction(scope, projectRoot, resolved, fileSystem, options.signal)
       if (probe.kind === 'unavailable') {
+        groupPaths.push(scopeInstructionFile(scope, projectRoot, resolved).displayPath)
         rollbackGroup()
         break
       }
@@ -383,6 +435,7 @@ export async function reconcileInstructionContext(
       const { file: probedFile } = probe
       if (seenAbsolutePaths.has(probedFile.absolutePath)) continue
       seenAbsolutePaths.add(probedFile.absolutePath)
+      groupPaths.push(probedFile.displayPath)
       const cached = versions.get(scope)
       const metadataUnchanged = cached !== undefined
         && cached.path === probedFile.displayPath
@@ -393,6 +446,7 @@ export async function reconcileInstructionContext(
           && previous.path === cached.path
           && previous.digest === cached.digest
         if (rendered) {
+          groupVersions.set(scope, cached)
           // Unchanged and previously rendered: keep it, but an earlier group member
           // that now matches its trimmed content makes this the duplicate to remove.
           if (registerKeptTrimmed(group, cached.trimmedDigest)) pushRemoval(scope, previous.path, cached)
@@ -430,6 +484,7 @@ export async function reconcileInstructionContext(
       }
       if (previous !== undefined && previous.action !== 'remove' && previous.path === file.displayPath && previous.digest === currentDigest) {
         versions.set(scope, nextVersion)
+        groupVersions.set(scope, nextVersion)
         continue
       }
       const action = previous === undefined || previous.action === 'remove' ? 'set' : 'replace'
@@ -441,16 +496,33 @@ export async function reconcileInstructionContext(
       }
       items.push({ change, file })
       versionUpdates.push({ change, state: nextVersion })
+      delivered.set(scope, change)
     }
+    if (groupPaths.length === 0) continue
+    if (items.length > itemStart) {
+      // This pass rendered the group, so its content is in the pending context.
+      // A sibling probe failure still leaves the group's prose deliverable.
+      continue
+    }
+    // Nothing rendered: the provider could not settle the group, or the byte
+    // budget or deduplication dropped the candidates. A scope the model already
+    // holds stays settled, because its instructions did reach a context.
+    const visible = probedScopes.some((scope) => {
+      const state = groupVersions.get(scope)
+      const previous = delivered.get(scope)
+      return state !== undefined && previous !== undefined && previous.action !== 'remove'
+    })
+    if (!visible) unconfirmed.push({ changes: [], paths: groupPaths })
   }
-  if (items.length === 0) return undefined
+  if (items.length === 0) return { versionUpdates: [], unconfirmed }
   const rendered = renderInstructionChanges(items, resolved.maxBytes)
   // When no transition survived rendering (tiny budgets render notice-only
   // text), emit nothing and commit nothing — the uncommitted versions make the
   // next pass retry instead of spamming notice-only contexts.
-  if (rendered.text.length === 0 || rendered.changes.length === 0) return undefined
+  if (rendered.text.length === 0 || rendered.changes.length === 0) return { versionUpdates: [], unconfirmed }
   return {
     context: agentInstructionsHook(rendered.text, rendered.changes),
     versionUpdates: retainedInstructionVersionUpdates(versionUpdates, rendered.changes),
+    unconfirmed,
   }
 }
