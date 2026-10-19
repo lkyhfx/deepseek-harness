@@ -505,17 +505,24 @@ export async function reconcileInstructionContext(
       continue
     }
     // Nothing rendered: the provider could not settle the group, or the byte
-    // budget or deduplication dropped the candidates. A scope the model already
-    // holds stays settled, because its instructions did reach a context.
-    const visible = probedScopes.some((scope) => {
+    // budget or deduplication dropped the candidates. Confirmation is per
+    // candidate, so one settled file never vouches for an unread sibling.
+    const pending = groupPaths.filter((path) => {
+      const scope = instructionScopeKey(path)
       const state = groupVersions.get(scope)
       const previous = delivered.get(scope)
-      return state !== undefined && previous !== undefined && previous.action !== 'remove'
+      return state === undefined || previous === undefined || previous.action === 'remove'
     })
-    if (!visible) unconfirmed.push({ changes: [], paths: groupPaths })
+    if (pending.length > 0) unconfirmed.push({ changes: [], paths: pending })
   }
   if (items.length === 0) return { versionUpdates: [], unconfirmed }
   const rendered = renderInstructionChanges(items, resolved.maxBytes)
+  // A truncated file delivered only part of its prose, so the model cannot be
+  // shown to hold its complete requirements even though it received a heading
+  // and some content. Only a complete delivery settles a strict pre-edit check.
+  if (rendered.truncatedPaths.length > 0) {
+    unconfirmed.push({ changes: [], paths: rendered.truncatedPaths })
+  }
   // When no transition survived rendering (tiny budgets render notice-only
   // text), emit nothing and commit nothing — the uncommitted versions make the
   // next pass retry instead of spamming notice-only contexts.

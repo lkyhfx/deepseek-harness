@@ -170,14 +170,15 @@ export function apply(ctx: Context, config: Config): void {
   const projectionLifecycle = new AbortController()
   type ProjectionTouch = { agent: Agent; path: string }
   const executionTouches = new Map<ToolExecutionToken, ProjectionTouch[]>()
-  // Instructions to ferry on a write held back by pre-edit protection. Keyed by
-  // the held agent, not the call: a deny never dispatches, so no token-keyed
-  // post-execute follow-up exists. Each entry serves the agent's next result.
-  const guardedInstructions = new WeakMap<Agent, UserMessage>()
+  // Instructions to ferry on a write held back by pre-edit protection, keyed by
+  // the refused call's execution token. A deny skips dispatch but still reaches
+  // post-execute with that token, so unrelated results never consume the entry.
+  const guardedInstructions = new Map<ToolExecutionToken, UserMessage>()
   ctx.effect(
     () => () => {
       projectionLifecycle.abort(new Error('agent-instructions disposed'))
       executionTouches.clear()
+      guardedInstructions.clear()
     },
     'agent-instructions.projectionLifecycle',
   )
@@ -395,10 +396,11 @@ export function apply(ctx: Context, config: Config): void {
    * @returns a denial carrying the pending instructions, or undefined to proceed.
    */
   const inspectWriteInstructions = async (
+    exec: ToolExecution,
     agent: Agent,
     filePath: string,
-    signal: AbortSignal,
   ): Promise<PreToolDecision | undefined> => {
+    const signal = exec.signal
     const fileSystem = ctx.get('fs')
     if (fileSystem === undefined) return undefined
     const cwd = await ctx.workingDirectory.ensure(agent, signal)
@@ -438,7 +440,7 @@ export function apply(ctx: Context, config: Config): void {
     // The version cache is deliberately not committed here: a ferried context is
     // not durable until the loop enters it, so a lost ferry leaves the call
     // held rather than silently allowing the uninstructed write.
-    if (context !== undefined) guardedInstructions.set(agent, context)
+    if (context !== undefined) guardedInstructions.set(exec.token, context)
     if (context === undefined && unconfirmed.length === 0) return undefined
     if (unconfirmed.length === 0) {
       // The pending context carries these files to the next result, so the model
@@ -469,7 +471,7 @@ export function apply(ctx: Context, config: Config): void {
     const agent = exec.agent
     const filePath = filePathFromExecution(exec)
     if (agent === undefined || filePath === undefined) return undefined
-    return await inspectWriteInstructions(agent, filePath, exec.signal)
+    return await inspectWriteInstructions(exec, agent, filePath)
   }
 
   const stepIsOpen = (session: Session): boolean => {
@@ -540,11 +542,9 @@ export function apply(ctx: Context, config: Config): void {
   })
 
   ctx.on('tools/post-execute', async (exec: ToolExecution, _result, next): Promise<PostToolDecision> => {
-    const agent = exec.agent
-    if (agent === undefined) return await next()
-    const pending = guardedInstructions.get(agent)
+    const pending = guardedInstructions.get(exec.token)
     if (pending === undefined) return await next()
-    guardedInstructions.delete(agent)
+    guardedInstructions.delete(exec.token)
     // Delegate first so downstream policies still decide this result, then
     // compose: a blocked result keeps its feedback and only gains the context,
     // while an accepted result never loses a content or value replacement.

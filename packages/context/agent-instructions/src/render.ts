@@ -268,12 +268,13 @@ function changedSectionText(item: ChangeRenderItem): string {
  * Render one reconciliation batch and retain only transitions that fit.
  * @param items - ordered state transitions and current file contents.
  * @param maxBytes - maximum UTF-8 bytes allowed in the rendered batch.
- * @returns bounded prompt text and the transitions actually represented by it.
+ * @returns bounded prompt text, the transitions actually represented by it, and
+ * the display paths whose content was cut short by the byte budget.
  */
 export function renderInstructionChanges(
   items: ChangeRenderItem[],
   maxBytes: number,
-): { text: string; changes: AgentInstructionChange[] } {
+): { text: string; changes: AgentInstructionChange[]; truncatedPaths: string[] } {
   const byAbsolutePath = new Map(items.map(item => [item.file.absolutePath, item]))
   const style: RenderStyle = {
     intro: '',
@@ -290,6 +291,7 @@ export function renderInstructionChanges(
     changes: items
       .filter(item => represented.has(item.file.absolutePath))
       .map(item => item.change),
+    truncatedPaths: rendered.truncated.map(entry => entry.displayPath),
   }
 }
 

@@ -6201,6 +6201,109 @@ describe('pre-edit protection', () => {
     }
   })
 
+  it('denies a write when one candidate of a loaded directory group is unreadable', async () => {
+    const root = join(await tempRepo(), 'virtual-repo')
+    const home = join(await tempRepo(), 'virtual-home')
+    const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
+    pinHarnessHome(home)
+    try {
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(RecordingFileSystem)
+      const fs = ctx.fs as RecordingFileSystem
+      fs.entries.set(join(root, '.git'), { type: 'directory' })
+      fs.entries.set(join(root, 'pkg/AGENTS.md'), { type: 'file', content: 'agents rule' })
+      fs.entries.set(join(root, 'pkg/CLAUDE.md'), { type: 'file', content: 'claude rule' })
+      await ctx.plugin(ToolFs)
+      await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      // AGENTS.md reaches the model through a read of its directory; CLAUDE.md
+      // then becomes unreadable before the write is attempted.
+      const read = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('read-before-claude-fails'),
+        name: 'read',
+        arguments: { file_path: join(root, 'pkg/AGENTS.md') },
+        agent,
+      })
+      expect(read.isError).toBe(false)
+      await syncAgentInstructions(ctx, agent)
+      const entered = claimInbox(agent, 'next-step')
+      expect(blocksText(entered[0]?.content)).toContain('agents rule')
+      for (const message of entered) {
+        const event = agent.session.append('user/message', message, { surfaceOp: 'append' })
+        ctx.emit('session/event', agent.session, event)
+      }
+      fs.throwOnStat.add(join(root, 'pkg/CLAUDE.md'))
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-with-partial-group'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+      expect(blocksText(result.content)).toContain('pkg/CLAUDE.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await ctx.fiber.dispose()
+      await rm(dirname(root), { recursive: true, force: true })
+      await rm(dirname(home), { recursive: true, force: true })
+    }
+  })
+
+  it('holds a write when the byte budget truncates an applicable instruction file', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), `short head\n${'padding line\n'.repeat(200)}must run ttsc-graph before editing`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      // A budget that fits a heading and a prefix but not the whole file.
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const first = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-truncated-rules'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(first.isError).toBe(true)
+      expect(blocksText(first.content)).toContain('cannot confirm the workspace instructions')
+
+      // Entering the truncated text does not settle the file: the model never
+      // saw the tail, so the repeat stays held too.
+      for (const message of first.additionalContexts ?? []) {
+        const event = agent.session.append('user/message', message, { surfaceOp: 'append' })
+        ctx.emit('session/event', agent.session, event)
+      }
+      const second = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-truncated-rules-repeat'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(second.isError).toBe(true)
+      expect(blocksText(second.content)).toContain('cannot confirm the workspace instructions')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
   it('runs downstream post-execute policies before adding ferried instructions', async () => {
     const root = await tempRepo()
     const home = await tempRepo()
