@@ -16,7 +16,13 @@ import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { Session, UserMessage } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-projection'
-import type { ToolExecution, ToolExecutionResult, ToolExecutionToken } from '@deepseek-ai/dsh-tools'
+import type {
+  PostToolDecision,
+  PreToolDecision,
+  ToolExecution,
+  ToolExecutionResult,
+  ToolExecutionToken,
+} from '@deepseek-ai/dsh-tools'
 import { Config, resolveConfig, workspaceBaselineIdentity, type ResolvedConfig } from './config.ts'
 import { findProjectRoot, loadBaselineInstructionSet } from './files.ts'
 import { trimmedInstructionDigest } from './digest.ts'
@@ -28,8 +34,10 @@ import {
   agentInstructionsMessage,
   type InstructionVersionCache,
   type AgentInstructionSource,
+  type ReconciledInstructionContext,
 } from './state.ts'
 import { instructionCandidateGroup, instructionScopeKey, scopeForDisplayPath, type AgentInstructionChange } from './render.ts'
+import { WORKSPACE_INSTRUCTIONS_PROTOCOL, WORKSPACE_PROTOCOL_SECTION } from './protocol.ts'
 
 export { Config, name }
 /** Services required by workspace instruction projection. */
@@ -44,6 +52,7 @@ export type {
 } from './files.ts'
 export { renderAgentInstructions } from './render.ts'
 export type { RenderedAgentInstructions, TruncatedInstruction } from './render.ts'
+export { WORKSPACE_INSTRUCTIONS_PROTOCOL, WORKSPACE_PROTOCOL_SECTION } from './protocol.ts'
 
 function visibleBaselineSource(
   agent: Agent,
@@ -75,6 +84,12 @@ function sameContextPayload(left: UserMessage, right: UserMessage): boolean {
 
 const FILE_TOUCH_TOOL_NAMES = new Set(['read', 'write', 'edit'])
 
+/**
+ * Structured tools whose call modifies a file's content. Only these are held
+ * back before execution; `read` cannot write, so it stays discovery-only.
+ */
+const FILE_WRITE_TOOL_NAMES = new Set(['write', 'edit'])
+
 function filePathFromExecution(exec: ToolExecution): string | undefined {
   if (!FILE_TOUCH_TOOL_NAMES.has(exec.name)) return undefined
   if (typeof exec.arguments !== 'object' || exec.arguments === null) return undefined
@@ -83,8 +98,41 @@ function filePathFromExecution(exec: ToolExecution): string | undefined {
   return filePath.length > 0 ? filePath : undefined
 }
 
+/**
+ * Denial identity for a write held back by pre-edit protection. Carried as
+ * {@link ToolErrorInfo} so operators and tests can distinguish this outcome
+ * from a permission denial or a schema failure.
+ */
+const PRE_EDIT_GUARD_INFO = { name: 'WorkspaceInstructionPreEditGuard', code: 'WORKSPACE_INSTRUCTIONS_NOT_LOADED' }
+
+/**
+ * Explain a held-back write so the model can act on the refusal instead of
+ * retrying the same call. The applicable instruction files are injected
+ * separately, as a user-role message, on the next step.
+ * @param paths - display paths of instruction files not yet loaded.
+ * @returns the model-facing denial reason.
+ */
+function preEditDenialReason(paths: readonly string[]): string {
+  const listed = paths.map(path => `\`${path}\``).join(', ')
+  return `workspace instructions must be loaded before modifying this file: ${listed}. `
+    + 'They are injected as the next message. Read them and repeat this modification, adjusting it to satisfy those instructions.'
+}
+
 export function apply(ctx: Context, config: Config): void {
   const resolved: ResolvedConfig = resolveConfig(config)
+  // Registered as one named first-party section rather than folded into the
+  // system prompt wholesale, so persona, tool guidance, and per-agent scoped
+  // overrides keep their own slots. The optional read keeps a providerless
+  // composition loading without the section.
+  const systemPrompt = ctx.get('systemPrompt')
+  if (systemPrompt !== undefined) {
+    systemPrompt.section({
+      name: WORKSPACE_PROTOCOL_SECTION,
+      order: systemPrompt.getSectionOrder('WORKSPACE_INSTRUCTIONS_PROTOCOL'),
+      text: WORKSPACE_INSTRUCTIONS_PROTOCOL,
+      interpolate: false,
+    })
+  }
   const instructionVersions: InstructionVersionCache = new WeakMap()
   const baselinePreparations = new WeakMap<Session, {
     identity: string
@@ -93,10 +141,14 @@ export function apply(ctx: Context, config: Config): void {
   const projectionLifecycle = new AbortController()
   type ProjectionTouch = { agent: Agent; path: string }
   const executionTouches = new Map<ToolExecutionToken, ProjectionTouch[]>()
+  // Pending instructions for a write held back by pre-edit protection, keyed by
+  // the refused call's execution token. Entry lifetime is one execution.
+  const guardedInstructions = new Map<ToolExecutionToken, UserMessage>()
   ctx.effect(
     () => () => {
       projectionLifecycle.abort(new Error('agent-instructions disposed'))
       executionTouches.clear()
+      guardedInstructions.clear()
     },
     'agent-instructions.projectionLifecycle',
   )
@@ -302,6 +354,62 @@ export function apply(ctx: Context, config: Config): void {
     while ((projection = projectionTails.get(agent)) !== undefined) await projection
   }
 
+  /**
+   * Refuse a structured write whose applicable workspace instructions the model
+   * has not received yet, and ferry those instructions on the refusal.
+   *
+   * Only a call whose target path is readable from `arguments` is checked, so
+   * an unrecognized tool is never guessed at and arguments are never rewritten.
+   * Unavailable instruction state never refuses a call: a provider failure or
+   * an unknown project root must not strand a write the model may perform.
+   * @param exec - pending tool execution.
+   * @returns a denial carrying the pending instructions, or undefined to proceed.
+   */
+  const holdUninstructedWrite = async (exec: ToolExecution): Promise<PreToolDecision | undefined> => {
+    if (!resolved.preEditProtection) return undefined
+    if (!FILE_WRITE_TOOL_NAMES.has(exec.name)) return undefined
+    const agent = exec.agent
+    const filePath = filePathFromExecution(exec)
+    if (agent === undefined || filePath === undefined) return undefined
+    const fileSystem = ctx.get('fs')
+    if (fileSystem === undefined) return undefined
+    const cwd = await ctx.workingDirectory.ensure(agent, exec.signal)
+    let projectRoot: string
+    let pendingInstructions: ReconciledInstructionContext | undefined
+    try {
+      projectRoot = await findProjectRoot(cwd, resolved.projectRootMarkers, fileSystem, exec.signal)
+      // The baseline chain is loaded before the first request, so only the
+      // nested scopes this write's directory adds can still be missing.
+      pendingInstructions = await reconcileInstructionContext(
+        agent,
+        resolved,
+        instructionVersions,
+        fileSystem,
+        {
+          cwd,
+          authorityMessages: [],
+          scopeMessages: [],
+          touchedPaths: [filePath],
+          includeBaselineScopes: false,
+          projectRoot,
+          signal: exec.signal,
+        },
+      )
+    } catch (error: unknown) {
+      if (exec.signal.aborted) throw error
+      return undefined
+    }
+    if (pendingInstructions === undefined) return undefined
+    // The version cache is deliberately not committed here: the pending
+    // context is not durable until the loop enters it, so a lost ferry leaves
+    // the call held rather than silently allowing the uninstructed write.
+    guardedInstructions.set(exec.token, pendingInstructions.context)
+    const paths = pendingInstructions.context.source.kind === 'agent-instructions'
+      ? pendingInstructions.context.source.changes.map(change => change.path)
+      : []
+    return { kind: 'deny', reason: preEditDenialReason(paths), info: PRE_EDIT_GUARD_INFO }
+  }
+
   const stepIsOpen = (session: Session): boolean => {
     const boundary = ctx.sessionProjections.stateOf(session, 'turnBoundary')
     if (boundary === undefined) {
@@ -357,6 +465,23 @@ export function apply(ctx: Context, config: Config): void {
     const lastClaimedIndex = decision.messages.findLastIndex(message => messages.includes(message))
     const entered = decision.messages.toSpliced(lastClaimedIndex + 1, 0, desired)
     return { ...decision, messages: entered }
+  })
+
+  ctx.on('tools/pre-execute', async (exec: ToolExecution, next: () => Promise<PreToolDecision>): Promise<PreToolDecision> => {
+    const decision = await next()
+    // A downstream denial already refuses the call; adding a second reason
+    // would only replace the operator-visible cause.
+    if (decision.kind !== 'allow') return decision
+    // Async because it probes instruction files; the registry rechecks
+    // cancellation after it settles, so an aborted call never waits on I/O.
+    return await holdUninstructedWrite(exec) ?? { kind: 'allow' }
+  })
+
+  ctx.on('tools/post-execute', (exec: ToolExecution, _result, next): Promise<PostToolDecision> => {
+    const pending = guardedInstructions.get(exec.token)
+    if (pending === undefined) return next()
+    guardedInstructions.delete(exec.token)
+    return Promise.resolve({ kind: 'accept', additionalContexts: [pending] })
   })
 
   ctx.on('tools/result', (exec: ToolExecution, result: ToolExecutionResult) => {

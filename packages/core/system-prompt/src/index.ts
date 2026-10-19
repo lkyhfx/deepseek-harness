@@ -131,6 +131,9 @@ export interface PromptAssembly {
 const SECTION_ORDERS = {
   HARNESS_IDENTITY: -1000,
   DEPLOYMENT_PERSONA_PREFIX: 0,
+  // Governs how workspace instruction files are treated, so it precedes every
+  // policy and tool section that may reference them.
+  WORKSPACE_INSTRUCTIONS_PROTOCOL: 300,
   PLAN_POLICY: 500,
   TEAM_POLICY: 600,
   PTC_ONLY: 800,

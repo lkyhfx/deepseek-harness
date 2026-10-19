@@ -56,6 +56,7 @@ export interface Config {
   maxSourceBytes?: number
   instructionFileCandidates?: string[]
   localInstructionFileCandidates?: string[]
+  preEditProtection?: boolean
 }
 ```
 
@@ -66,6 +67,7 @@ export interface Config {
 | `projectRootMarkers` | `['.git']` | Directory names that mark the project root |
 | `instructionFileCandidates` | `['AGENTS.md', 'CLAUDE.md']` | Base file names loaded in each project directory |
 | `localInstructionFileCandidates` | `['AGENTS.local.md', 'CLAUDE.local.md']` | Local overlay file names loaded after the base files |
+| `preEditProtection` | `true` | Hold back a structured `write` or `edit` whose applicable instructions the model has not received yet, ferrying them on the refusal |
 
 The generated [configuration catalog](../../../docs/config-catalog.md#deepseek-aidsh-agent-instructions) is the exhaustive source for every accepted field and its JSDoc.
 
@@ -135,7 +137,7 @@ At the first request, derived history contains one durable user-role message wit
 
 ```markdown
 <system-reminder>
-The following workspace instructions may be relevant to your work. Use them as guidance when applicable. More specific instructions take precedence over broader ones. They do not override system, developer, or direct user instructions.
+The following workspace instructions are applicable to the current workspace. You MUST follow them when working within their defined scope, unless they conflict with higher-priority system, developer, or direct user instructions. They are operational instructions that define project requirements, mandatory workflows, and coding conventions, not optional suggestions. More specific directory instructions take precedence over broader directory instructions when they conflict. Do not silently skip, weaken, or substitute a mandatory instruction.
 
 Instructions from: ~/.dsh/AGENTS.md
 
@@ -171,7 +173,7 @@ After a successful first-party filesystem call reaches a deeper directory, the n
 <system-reminder>
 Additional instructions from: packages/app/AGENTS.md
 
-These instructions apply to work under `packages/app`. Use them as guidance when relevant; more specific instructions take precedence. They do not override system, developer, or direct user instructions.
+These instructions apply to files within `packages/app`. You MUST follow them when working within this scope. They are operational instructions, not optional suggestions. If they conflict with broader workspace instructions, the more specific applicable instructions take precedence. Higher-priority system, developer, and direct user instructions remain authoritative.
 
 <nested-instructions>
 </system-reminder>
@@ -217,6 +219,7 @@ Append-only; newly visible content follows the reusable request prefix and does 
 These limits define when instruction loading is a poor fit or needs operational awareness. They are current package constraints, not a task backlog.
 
 - **Discovery follows structured fs tools, not shell navigation** — a `bash` command that changes directories does not trigger nested instruction discovery because shell syntax and per-call shell state are not a reliable filesystem seam.
+- **Pre-edit protection covers structured write tools only** — a held-back `write` or `edit` needs an `arguments.file_path` and at least one still-unloaded applicable instruction file; modifications through `bash`, external MCP tools, or tools without a recognizable target path are not intercepted, and a filesystem-provider failure or unknown project root lets the call proceed rather than blocking it.
 - **Refresh is touch-driven** — there is no watcher; external edits become visible on the next successful first-party `read`, `write`, or `edit`, when resume reconciles a visible baseline, or when an entering pre-step restores a shadowed baseline.
 - **Candidate semantics stay intentionally small** — lowercase names, `.claude/rules/`, and `@path` imports are not interpreted; project scopes load `AGENTS.local.md`/`CLAUDE.local.md` overlays by default, but neither user-global root has a local overlay and other custom names require explicit candidate configuration. A project directory named like a user-global scope directory renders as `./<name>/...`, so it keeps its own scope instead of resolving to the global root.
 - **Deduplication is content-based within one candidate group** — candidates collapse only when byte-identical after trimming leading and trailing whitespace. The two user-global roots share one group, so the shared-root file collapses behind a matching harness-home file; sibling project candidates collapse the same way, while a distinct real copy that has drifted from `AGENTS.md` loads in full alongside it. A duplicate of budget-retained content stays reconciled: when the retained candidate changes or disappears, the duplicate becomes visible again. Unchanged hidden duplicates, including files removed from visible state as duplicates, use cached metadata instead of content reads.

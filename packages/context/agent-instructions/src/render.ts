@@ -15,9 +15,11 @@ import type { InstructionFile, LoadedInstructionFile } from './files.ts'
 
 const SYSTEM_REMINDER_OPEN = '<system-reminder>'
 const SYSTEM_REMINDER_CLOSE = '</system-reminder>'
-const AGENT_INSTRUCTIONS_INTRO = 'The following workspace instructions may be relevant to your work. '
-  + 'Use them as guidance when applicable. More specific instructions take precedence over broader ones. '
-  + 'They do not override system, developer, or direct user instructions.'
+const AGENT_INSTRUCTIONS_INTRO = 'The following workspace instructions are applicable to the current workspace. '
+  + 'You MUST follow them when working within their defined scope, unless they conflict with higher-priority system, developer, or direct user instructions. '
+  + 'They are operational instructions that define project requirements, mandatory workflows, and coding conventions, not optional suggestions. '
+  + 'More specific directory instructions take precedence over broader directory instructions when they conflict. '
+  + 'Do not silently skip, weaken, or substitute a mandatory instruction.'
 const REPLACEMENT_AGENT_INSTRUCTIONS_INTRO = 'This complete workspace instruction baseline replaces all earlier workspace instruction baselines. '
   + AGENT_INSTRUCTIONS_INTRO
 const EMPTY_REPLACEMENT_AGENT_INSTRUCTIONS_INTRO = 'This complete workspace instruction baseline replaces all earlier workspace instruction baselines. '
@@ -214,8 +216,10 @@ export function decodeScopeKey(scope: string): { directory: string; candidateNam
   return { directory: scope.slice(0, separator), candidateName: scope.slice(separator + 1) }
 }
 
-const ADDITIONAL_INSTRUCTIONS_GUIDANCE = 'Use them as guidance when relevant; more specific instructions take precedence. '
-  + 'They do not override system, developer, or direct user instructions.'
+const ADDITIONAL_INSTRUCTIONS_GUIDANCE = 'You MUST follow them when working within this scope. '
+  + 'They are operational instructions, not optional suggestions. '
+  + 'If they conflict with broader workspace instructions, the more specific applicable instructions take precedence. '
+  + 'Higher-priority system, developer, and direct user instructions remain authoritative.'
 
 function additionalSectionText(file: LoadedInstructionFile): string {
   const scope = scopeForDisplayPath(file.displayPath)
@@ -223,7 +227,7 @@ function additionalSectionText(file: LoadedInstructionFile): string {
   // never reach this model-visible sentence.
   const applicability = isUserGlobalDirectory(scope)
     ? 'These user-global instructions apply to all work.'
-    : `These instructions apply to work under \`${scope}\`.`
+    : `These instructions apply to files within \`${scope}\`.`
   return [
     `Additional instructions from: ${file.displayPath}`,
     '',

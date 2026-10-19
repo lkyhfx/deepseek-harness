@@ -32,6 +32,12 @@ export interface Config {
    * under the same per-directory trimmed-content dedup; empty disables the overlay.
    */
   localInstructionFileCandidates?: string[]
+  /**
+   * Hold back a structured `write` or `edit` whose applicable workspace
+   * instructions the model has not received yet, so those instructions reach
+   * the model before it modifies the file. Default true.
+   */
+  preEditProtection?: boolean
 }
 
 export const Config: z<Config> = z.object({
@@ -40,6 +46,7 @@ export const Config: z<Config> = z.object({
   maxSourceBytes: z.number().step(1).min(1).default(DEFAULT_MAX_SOURCE_BYTES),
   instructionFileCandidates: z.array(z.string()).default([...DEFAULT_INSTRUCTION_FILE_CANDIDATES]),
   localInstructionFileCandidates: z.array(z.string()).default([...DEFAULT_LOCAL_INSTRUCTION_FILE_CANDIDATES]),
+  preEditProtection: z.boolean().default(true),
 })
 
 /** Normalized instruction discovery configuration. */
@@ -55,6 +62,7 @@ export interface ResolvedDiscoveryConfig {
 export interface ResolvedConfig extends ResolvedDiscoveryConfig {
   maxBytes: number
   maxSourceBytes: number
+  preEditProtection: boolean
 }
 
 /**
@@ -96,6 +104,7 @@ export function resolveConfig(config: Config): ResolvedConfig {
     }),
     maxBytes: config.maxBytes,
     maxSourceBytes: config.maxSourceBytes ?? DEFAULT_MAX_SOURCE_BYTES,
+    preEditProtection: config.preEditProtection ?? true,
   }
 }
 
