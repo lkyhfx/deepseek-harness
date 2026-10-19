@@ -106,6 +106,10 @@ pnpm run dev:web | dev:desktop  # build:artifacts, then launch; Web also rebuild
 make web|dev-web|desktop|dev-desktop|build  # the same commands; ARGS='--no-open' forwards options
 ```
 
+### Global `dsh` installation
+
+After replacing global `dsh`, verify Cordis Loader resolves `node-addon-require-builtin` from its own location (a copy nested under `dsh` is insufficient): `DSH_GLOBAL_ROOT="$(npm root -g)" node -e 'require("node:module").createRequire(process.env.DSH_GLOBAL_ROOT + "/@deepseek-ai/cordis-plugin-loader/lib/index.js").resolve("node-addon-require-builtin")'`. On failure, install the Loader's declared version globally. Back up any profile before editing it; start `dsh web` normally and check plugin activation and page rendering.
+
 ### Host sandbox failures
 
 If a required `gh`, `pnpm`, build, test, or generator command fails because the sandbox blocks credentials, network, IPC, watching, or nested `sandbox-exec`, retry unchanged with the narrowest host escalation. Require sandbox evidence; never bypass test failures or the product sandbox.
