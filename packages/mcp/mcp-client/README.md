@@ -86,6 +86,8 @@ When the model calls an MCP tool, the call runs against the remote server with a
 
 Images are supported when the current model accepts image input and the harness attachment feature is enabled; they then appear in the conversation like other images. Otherwise — and for audio or embedded resources — the model sees a clear diagnostic message instead of nothing.
 
+A server that reports its result only through structured content, leaving the content blocks empty, still reaches the model: the complete structured value is rendered as JSON text, nested fields included. Servers that return content blocks keep that rendering, and a result with neither stays an explicit "no model-visible content" diagnostic. Programmatic and PTC callers always receive the original `content` and `structuredContent` fields.
+
 ### Startup, updates, and reconnection
 
 The server's tools appear before the harness starts its first turn. When the server changes its tool list, the model's tool set updates automatically; if the update fails, the previous tool set keeps working.
