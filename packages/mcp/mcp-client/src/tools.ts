@@ -246,7 +246,7 @@ export function createMcpToolDefinition(
   }
 }
 
-/** Build the canonical result schema and existing Native text projection. */
+/** Build the canonical result schema and the Native text projection. */
 function createOutput(rawName: string, structuredSchema: JsonSchemaNode | undefined): ToolDefinition['output'] {
   return {
     schema: {
@@ -259,10 +259,30 @@ function createOutput(rawName: string, structuredSchema: JsonSchemaNode | undefi
       additionalProperties: false,
     },
     render(_args: unknown, value: JsonValue) {
-      const result = value as McpResult
-      return [{ type: 'text', text: extractText(result.content, rawName) }]
+      return renderMcpResult(value as McpResult, rawName)
     },
   }
+}
+
+/**
+ * Project one canonical MCP value into the Native model-visible blocks.
+ *
+ * Advertised content blocks own the projection whenever the server returns
+ * any: text, resource links, and image diagnostics keep their rendering. A
+ * server that reports its result only through `structuredContent` returns an
+ * empty `content` array, so the structured value is serialized as JSON and the
+ * complete nested result stays readable. The canonical value keeps both fields,
+ * so programmatic and PTC callers reading `result.structuredContent` are unaffected.
+ *
+ * @param result - Canonical MCP value produced by the executor.
+ * @param rawName - Upstream tool name used in the empty-result diagnostic.
+ * @returns Ordered model-visible blocks; never an empty array.
+ */
+function renderMcpResult(result: McpResult, rawName: string): ContentBlock[] {
+  if (result.content.length === 0 && result.structuredContent !== undefined) {
+    return [{ type: 'text', text: JSON.stringify(result.structuredContent, null, 2) }]
+  }
+  return [{ type: 'text', text: extractText(result.content, rawName) }]
 }
 
 /**

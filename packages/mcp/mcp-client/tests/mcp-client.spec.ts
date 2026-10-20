@@ -10,7 +10,7 @@ import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import type { PostToolDecision } from '@deepseek-ai/dsh-tools'
-import { publicToolName, syncTools, type ToolBridgeOptions } from '@deepseek-ai/dsh-mcp-client/src/tools.ts'
+import { publicToolName, syncTools, type McpResult, type ToolBridgeOptions } from '@deepseek-ai/dsh-mcp-client/src/tools.ts'
 import { createTransport } from '@deepseek-ai/dsh-mcp-client/src/transport.ts'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
 
@@ -868,6 +868,131 @@ describe('tool execution', () => {
     const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('fallback'), name: 'mcp__srv__future-schema', arguments: {} })
     if (result.isError) throw new Error('unsupported MCP output schemas must fall back')
     expect(result.value).toEqual({ content: [], structuredContent: ['kept', { nested: true }] })
+  })
+
+  it('renders structuredContent as JSON text when the server returns no content', async () => {
+    const structuredContent = {
+      audit: 'Graph evidence',
+      next: {
+        action: 'inspect',
+        reason: 'More details required',
+      },
+      result: {
+        type: 'lookup',
+        hits: [{ name: 'ExampleService' }],
+      },
+    }
+    const client = createMockClient(
+      [{
+        name: 'graph',
+        inputSchema: { type: 'object' },
+        outputSchema: {
+          type: 'object',
+          properties: {
+            audit: { type: 'string' },
+            next: { type: 'object' },
+            result: { type: 'object' },
+          },
+        },
+      }],
+      { content: [], structuredContent },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('graph'), name: 'mcp__srv__graph', arguments: {} })
+
+    expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected structured-only result to succeed')
+    expect(result.value).toEqual({ content: [], structuredContent })
+    const text = textAt(result.content)
+    expect(JSON.parse(text)).toEqual(structuredContent)
+    expect(text).toContain('"audit": "Graph evidence"')
+    expect(text).toContain('"action": "inspect"')
+    expect(text).toContain('"name": "ExampleService"')
+    expect(text).not.toContain('[object Object]')
+  })
+
+  it('keeps declared content instead of structuredContent when both are present', async () => {
+    const client = createMockClient(
+      [{ name: 'both', inputSchema: { type: 'object' } }],
+      {
+        content: [{ type: 'text', text: 'Observed window.' }],
+        structuredContent: { window: 7 },
+      },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('both'), name: 'mcp__srv__both', arguments: {} })
+
+    expect(result.content).toEqual([{ type: 'text', text: 'Observed window.' }])
+    if (result.isError) throw new Error('expected declared content to succeed')
+    expect(result.value).toEqual({
+      content: [{ type: 'text', text: 'Observed window.' }],
+      structuredContent: { window: 7 },
+    })
+  })
+
+  it('preserves deep structuredContent nesting in the rendered JSON', async () => {
+    const structuredContent = {
+      roots: [{ name: 'Outer', children: [{ name: 'Inner', children: [{ name: 'Leaf', hits: [] }] }] }],
+      counts: { files: 3, symbols: [1, 2, 3] },
+      flags: [true, false, null],
+    }
+    const client = createMockClient(
+      [{ name: 'deep', inputSchema: { type: 'object' } }],
+      { content: [], structuredContent },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('deep'), name: 'mcp__srv__deep', arguments: {} })
+
+    expect(JSON.parse(textAt(result.content))).toEqual(structuredContent)
+  })
+
+  it('keeps the empty-result diagnostic when neither content nor structuredContent carries data', async () => {
+    const client = createMockClient(
+      [{ name: 'sparse', inputSchema: { type: 'object' } }],
+      { content: [] },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('sparse'), name: 'mcp__srv__sparse', arguments: {} })
+
+    expect(result.isError).toBe(false)
+    expect(result.content).toEqual([{ type: 'text', text: '(sparse returned no model-visible content)' }])
+  })
+
+  it('keeps the error semantics of a structured-only isError result', async () => {
+    const client = createMockClient(
+      [{ name: 'structured_fail', inputSchema: { type: 'object' } }],
+      { content: [], structuredContent: { code: 'UNKNOWN_SYMBOL' }, isError: true },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('structured_fail'), name: 'mcp__srv__structured_fail', arguments: {} })
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0]).toEqual({ type: 'text', text: 'Error: (structured_fail returned no model-visible content)' })
+    expect('value' in result).toBe(false)
+  })
+
+  it('passes the raw structuredContent structure through the programmatic tool result', async () => {
+    const structuredContent = {
+      audit: 'Graph evidence',
+      next: { action: 'inspect', reason: 'More details required' },
+      result: { type: 'lookup', hits: [{ name: 'ExampleService' }] },
+    }
+    const client = createMockClient(
+      [{ name: 'ptc_graph', inputSchema: { type: 'object' } }],
+      { content: [], structuredContent },
+    )
+
+    await syncTools(client as never, ctx, defaultOpts, new Map())
+    const result = await ctx.tools.execute({ signal: testToolSignal, callId: ToolCallId('ptc'), name: 'mcp__srv__ptc_graph', arguments: {} })
+
+    if (result.isError) throw new Error('expected structured-only result to succeed')
+    expect((result.value as McpResult).structuredContent).toEqual(structuredContent)
+    expect(result.content).toHaveLength(1)
   })
 
   it('maps isError to an error result via throw', async () => {
