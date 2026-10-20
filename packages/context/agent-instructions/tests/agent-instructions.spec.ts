@@ -1129,7 +1129,7 @@ describe('workspace context rendering', () => {
     expect(rendered.changes).toEqual([])
   })
 
-  it('commits a change when its file-specific semantic section survives truncation', () => {
+  it('keeps a truncated change without its digest when its file-specific section survives', () => {
     const change = {
       action: 'replace' as const,
       scope: sk('pkg', 'AGENTS.md'),
@@ -1142,7 +1142,9 @@ describe('workspace context rendering', () => {
     }], 400)
 
     expect(rendered.text).toContain('Updated instructions from: pkg/AGENTS.md')
-    expect(rendered.changes).toEqual([change])
+    // The model read only a prefix, so the delivery must not certify the full digest.
+    expect(rendered.changes).toEqual([{ action: 'replace', scope: change.scope, path: change.path }])
+    expect(rendered.truncatedPaths).toEqual(['pkg/AGENTS.md'])
   })
 
   // Each prose-derived budget is the smallest current value that retains the named heading plus a zero-byte marker.
