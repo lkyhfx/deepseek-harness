@@ -15,9 +15,11 @@ import type { InstructionFile, LoadedInstructionFile } from './files.ts'
 
 const SYSTEM_REMINDER_OPEN = '<system-reminder>'
 const SYSTEM_REMINDER_CLOSE = '</system-reminder>'
-const AGENT_INSTRUCTIONS_INTRO = 'The following workspace instructions may be relevant to your work. '
-  + 'Use them as guidance when applicable. More specific instructions take precedence over broader ones. '
-  + 'They do not override system, developer, or direct user instructions.'
+const AGENT_INSTRUCTIONS_INTRO = 'The following workspace instructions are applicable to the current workspace. '
+  + 'You MUST follow them when working within their defined scope, unless they conflict with higher-priority system, developer, or direct user instructions. '
+  + 'They are operational instructions that define project requirements, mandatory workflows, and coding conventions, not optional suggestions. '
+  + 'More specific directory instructions take precedence over broader directory instructions when they conflict. '
+  + 'Do not silently skip, weaken, or substitute a mandatory instruction.'
 const REPLACEMENT_AGENT_INSTRUCTIONS_INTRO = 'This complete workspace instruction baseline replaces all earlier workspace instruction baselines. '
   + AGENT_INSTRUCTIONS_INTRO
 const EMPTY_REPLACEMENT_AGENT_INSTRUCTIONS_INTRO = 'This complete workspace instruction baseline replaces all earlier workspace instruction baselines. '
@@ -214,8 +216,10 @@ export function decodeScopeKey(scope: string): { directory: string; candidateNam
   return { directory: scope.slice(0, separator), candidateName: scope.slice(separator + 1) }
 }
 
-const ADDITIONAL_INSTRUCTIONS_GUIDANCE = 'Use them as guidance when relevant; more specific instructions take precedence. '
-  + 'They do not override system, developer, or direct user instructions.'
+const ADDITIONAL_INSTRUCTIONS_GUIDANCE = 'You MUST follow them when working within this scope. '
+  + 'They are operational instructions, not optional suggestions. '
+  + 'If they conflict with broader workspace instructions, the more specific applicable instructions take precedence. '
+  + 'Higher-priority system, developer, and direct user instructions remain authoritative.'
 
 function additionalSectionText(file: LoadedInstructionFile): string {
   const scope = scopeForDisplayPath(file.displayPath)
@@ -223,7 +227,7 @@ function additionalSectionText(file: LoadedInstructionFile): string {
   // never reach this model-visible sentence.
   const applicability = isUserGlobalDirectory(scope)
     ? 'These user-global instructions apply to all work.'
-    : `These instructions apply to work under \`${scope}\`.`
+    : `These instructions apply to files within \`${scope}\`.`
   return [
     `Additional instructions from: ${file.displayPath}`,
     '',
@@ -264,12 +268,13 @@ function changedSectionText(item: ChangeRenderItem): string {
  * Render one reconciliation batch and retain only transitions that fit.
  * @param items - ordered state transitions and current file contents.
  * @param maxBytes - maximum UTF-8 bytes allowed in the rendered batch.
- * @returns bounded prompt text and the transitions actually represented by it.
+ * @returns bounded prompt text, the transitions actually represented by it, and
+ * the display paths whose content was cut short by the byte budget.
  */
 export function renderInstructionChanges(
   items: ChangeRenderItem[],
   maxBytes: number,
-): { text: string; changes: AgentInstructionChange[] } {
+): { text: string; changes: AgentInstructionChange[]; omittedPaths: string[]; truncatedPaths: string[] } {
   const byAbsolutePath = new Map(items.map(item => [item.file.absolutePath, item]))
   const style: RenderStyle = {
     intro: '',
@@ -281,11 +286,21 @@ export function renderInstructionChanges(
   }
   const rendered = renderInstructionContext(items.map(item => item.file), maxBytes, style)
   const represented = new Set(rendered.represented.map(file => file.absolutePath))
+  const truncatedPaths = rendered.truncated
+    .filter(entry => entry.includedBytes < entry.originalBytes)
+    .map(entry => entry.displayPath)
+  const incomplete = new Set(truncatedPaths)
   return {
     text: rendered.text,
+    // A represented prefix is not proof that all of the file's rules reached
+    // the model. An absent digest persists incomplete delivery across steps.
     changes: items
       .filter(item => represented.has(item.file.absolutePath))
-      .map(item => item.change),
+      .map(({ change }) => incomplete.has(change.path)
+        ? { action: change.action, scope: change.scope, path: change.path }
+        : change),
+    omittedPaths: rendered.omitted.map(file => file.displayPath),
+    truncatedPaths,
   }
 }
 

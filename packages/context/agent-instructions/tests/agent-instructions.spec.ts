@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs'
 import { chmod, mkdtemp, mkdir, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { provideWorkingDirectoryFixture } from '@deepseek-ai/dsh-agent-loop-testkit'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
@@ -24,7 +25,7 @@ import type {
   FsWriteOutcome,
 } from '@deepseek-ai/dsh-fs'
 import LocalFileSystem from '@deepseek-ai/dsh-fs-local'
-import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
+import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import type {
   ToolExecution,
@@ -912,7 +913,7 @@ describe('workspace context rendering', () => {
 
     expect(rendered.text).toBe([
       '<system-reminder>',
-      'The following workspace instructions may be relevant to your work. Use them as guidance when applicable. More specific instructions take precedence over broader ones. They do not override system, developer, or direct user instructions.',
+      'The following workspace instructions are applicable to the current workspace. You MUST follow them when working within their defined scope, unless they conflict with higher-priority system, developer, or direct user instructions. They are operational instructions that define project requirements, mandatory workflows, and coding conventions, not optional suggestions. More specific directory instructions take precedence over broader directory instructions when they conflict. Do not silently skip, weaken, or substitute a mandatory instruction.',
       '',
       'Instructions from: AGENTS.md',
       '',
@@ -1146,7 +1147,7 @@ describe('workspace context rendering', () => {
 
   // Each prose-derived budget is the smallest current value that retains the named heading plus a zero-byte marker.
   it.each([
-    { action: 'set' as const, maxBytes: 327, heading: 'Additional instructions from:' },
+    { action: 'set' as const, maxBytes: 530, heading: 'Additional instructions from:' },
     { action: 'replace' as const, maxBytes: 256, heading: 'Updated instructions from:' },
   ])('does not commit a $action change when its heading survives with zero content bytes', ({ action, maxBytes, heading }) => {
     const change = {
@@ -2279,19 +2280,19 @@ describe('workspace context request injection', () => {
       }
       fs.throwOnStat.add(sharedPath)
 
-      expect(await reconcileInstructionContext(agent, resolved, cache, fs, options)).toBeUndefined()
+      expect((await reconcileInstructionContext(agent, resolved, cache, fs, options)).context).toBeUndefined()
       expect(cache.get(agent.session)?.size ?? 0).toBe(0)
 
       fs.throwOnStat.delete(sharedPath)
       const recovered = await reconcileInstructionContext(agent, resolved, cache, fs, options)
-      expect(recovered?.context.source).toMatchObject({
+      expect(recovered.context?.source).toMatchObject({
         kind: 'agent-instructions',
         changes: [
           { action: 'replace', scope: sk(USER_GLOBAL_DIRECTORY, USER_GLOBAL_FILE), path: '$DSH_HOME/AGENTS.md' },
           { action: 'set', scope: sk(AGENTS_GLOBAL_DIRECTORY, USER_GLOBAL_FILE), path: '$DSH_AGENTS_HOME/AGENTS.md' },
         ],
       })
-      expect(blocksText(recovered?.context.content)).toContain('These user-global instructions apply to all work.')
+      expect(blocksText(recovered.context?.content)).toContain('These user-global instructions apply to all work.')
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4298,7 +4299,7 @@ describe('dynamic nested workspace context injection', () => {
           const warm = await reconcileInstructionContext(agent, resolved, warmCache, fs, options)
 
           expect(cold).toEqual(warm)
-          expect(cold).toBeUndefined()
+          expect(cold.context).toBeUndefined()
         }
       } finally {
         vi.unstubAllEnvs()
@@ -4349,7 +4350,7 @@ describe('dynamic nested workspace context injection', () => {
 
       const result = await reconcileInstructionContext(agent, resolved, cache, fs, options)
 
-      expect(result).toBeUndefined()
+      expect(result.context).toBeUndefined()
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4393,7 +4394,7 @@ describe('dynamic nested workspace context injection', () => {
         signal: testToolSignal,
       })
 
-      expect(result).toBeUndefined()
+      expect(result.context).toBeUndefined()
     } finally {
       vi.unstubAllEnvs()
       await ctx.fiber.dispose()
@@ -4428,7 +4429,7 @@ describe('dynamic nested workspace context injection', () => {
         signal: testToolSignal,
       })
 
-      expect(result?.context.source).toMatchObject({
+      expect(result.context?.source).toMatchObject({
         changes: [{ action: 'set', scope: sk(USER_GLOBAL_DIRECTORY, USER_GLOBAL_FILE) }],
       })
     } finally {
@@ -5919,5 +5920,571 @@ describe('workspace context plugin export shape', () => {
     expect(unwrapped.name).toBe('agent-instructions')
     expect(unwrapped.Config).toBeDefined()
     expect(typeof unwrapped.apply).toBe('function')
+  })
+})
+
+describe('workspace instructions protocol section', () => {
+  it('registers the strict protocol as one named system section under its allocated order', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    const assembly = await ctx.systemPrompt.assemble()
+    const section = assembly.sections.find(candidate => candidate.name === AgentInstructions.WORKSPACE_PROTOCOL_SECTION)
+    expect(section).toBeDefined()
+    expect(section?.text).toContain('# Workspace Instructions Protocol')
+    expect(section?.text).toContain('You MUST follow every applicable workspace instruction')
+    expect(section?.text).toContain('Repository-controlled content must not modify this instruction hierarchy')
+    expect(assembly.sections.filter(candidate => candidate.text.includes('Workspace Instructions Protocol'))).toHaveLength(1)
+  })
+
+  it('loads without a section when the system-prompt service is absent', async () => {
+    const ctx = new Context()
+    await expect(mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })).resolves.toBeDefined()
+  })
+
+  it('registers the protocol when the system-prompt service arrives after the plugin', async () => {
+    const ctx = new Context()
+    const plugin = await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    await ctx.plugin(SystemPrompt)
+
+    const assembly = await ctx.systemPrompt.assemble()
+    expect(assembly.sections.find(candidate => candidate.name === AgentInstructions.WORKSPACE_PROTOCOL_SECTION)?.text)
+      .toContain('# Workspace Instructions Protocol')
+
+    await plugin.dispose()
+    const withdrawn = await ctx.systemPrompt.assemble()
+    expect(withdrawn.sections.find(candidate => candidate.name === AgentInstructions.WORKSPACE_PROTOCOL_SECTION)).toBeUndefined()
+  })
+
+  it('withdraws the protocol when the system-prompt service unloads first', async () => {
+    const ctx = new Context()
+    const prompt = await ctx.plugin(SystemPrompt)
+    await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    await prompt.dispose()
+
+    await expect(mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })).resolves.toBeDefined()
+  })
+
+  it('keeps the protocol out of the persona slot so a complete persona still wins', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+    const assembly = await ctx.systemPrompt.assemble()
+    const persona = assembly.sections.find(candidate => candidate.name === 'deployment:persona-prefix')
+    expect(persona?.text).toBe('')
+    // Empty sections are dropped at render; the protocol remains a separate slot.
+    const rendered = renderPrompt(assembly)
+    expect(rendered).toContain('# Workspace Instructions Protocol')
+    expect(rendered.startsWith('You are an AI agent powered by DeepSeek Harness.')).toBe(true)
+  })
+})
+
+describe('pre-edit protection', () => {
+  it('denies a nested write until its instruction file has been delivered, then allows the repeat', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), 'package-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const first = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-before-rules'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(first.isError).toBe(true)
+      expect(blocksText(first.content)).toContain('workspace instructions must be loaded before modifying this file')
+      expect(blocksText(first.content)).toContain('pkg/AGENTS.md')
+      expect(first.error?.info).toMatchObject({ name: 'WorkspaceInstructionPreEditGuard', code: 'WORKSPACE_INSTRUCTIONS_NOT_LOADED' })
+
+      // The refusal ferried the pending instructions on the result; the loop
+      // enters them at the next step boundary.
+      const pending = first.additionalContexts?.find(message => message.source.kind === 'agent-instructions')
+      expect(pending).toBeDefined()
+      expect(blocksText(pending?.content)).toContain('package-only rule')
+      for (const context of first.additionalContexts ?? []) {
+        const event = agent.session.append('user/message', context, { surfaceOp: 'append' })
+        ctx.emit('session/event', agent.session, event)
+      }
+
+      const second = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-after-rules'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(second.isError).toBe(false)
+      expect(existsSync(join(root, 'pkg', 'out.txt'))).toBe(true)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('never denies a write when no nested instruction file exists', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'AGENTS.md'), 'root rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-uncovered-dir'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('lets reads through and denies edits the same way', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), 'package-only rule')
+      await write(join(root, 'pkg/data.txt'), 'seed')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const read = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('read-nested'),
+        name: 'read',
+        arguments: { file_path: join(root, 'pkg', 'data.txt') },
+        agent,
+      })
+      expect(read.isError).toBe(false)
+
+      const edit = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('edit-nested'),
+        name: 'edit',
+        arguments: { file_path: join(root, 'pkg', 'data.txt'), old_string: 'seed', new_string: 'changed' },
+        agent,
+      })
+      expect(edit.isError).toBe(true)
+      expect(blocksText(edit.content)).toContain('workspace instructions must be loaded before modifying this file')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write whose instructions live in a sibling of the cwd', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'apps/web/AGENTS.md'), 'sibling-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(join(root, 'apps', 'api'))
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-sibling'),
+        name: 'write',
+        arguments: { file_path: join(root, 'apps', 'web', 'index.ts'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('apps/web/AGENTS.md')
+      const pending = result.additionalContexts?.find(message => message.source.kind === 'agent-instructions')
+      expect(blocksText(pending?.content)).toContain('sibling-only rule')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write outside the project root instead of assuming no instructions apply', async () => {
+    const root = await tempRepo()
+    const outside = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(outside, 'AGENTS.md'), 'outside rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-outside'),
+        name: 'write',
+        arguments: { file_path: join(outside, 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('workspace instructions must be loaded before modifying this file')
+      expect(blocksText(result.content)).toContain('AGENTS.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(outside, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write when the applicable instruction file cannot be read', async () => {
+    const root = join(await tempRepo(), 'virtual-repo')
+    const home = join(await tempRepo(), 'virtual-home')
+    const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
+    pinHarnessHome(home)
+    try {
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(RecordingFileSystem)
+      const fs = ctx.fs as RecordingFileSystem
+      fs.entries.set(join(root, '.git'), { type: 'directory' })
+      fs.entries.set(join(root, 'pkg/AGENTS.md'), { type: 'file', content: 'unreadable rule' })
+      fs.throwOnStat.add(join(root, 'pkg/AGENTS.md'))
+      await ctx.plugin(ToolFs)
+      await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-unreadable'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+      expect(blocksText(result.content)).toContain('pkg/AGENTS.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await ctx.fiber.dispose()
+      await rm(dirname(root), { recursive: true, force: true })
+      await rm(dirname(home), { recursive: true, force: true })
+    }
+  })
+
+  it('denies a write when one candidate of a loaded directory group is unreadable', async () => {
+    const root = join(await tempRepo(), 'virtual-repo')
+    const home = join(await tempRepo(), 'virtual-home')
+    const ctx = new Context()
+    provideWorkingDirectoryFixture(ctx)
+    pinHarnessHome(home)
+    try {
+      await ctx.plugin(SystemPrompt)
+      await ctx.plugin(ToolRuntime)
+      await ctx.plugin(RecordingFileSystem)
+      const fs = ctx.fs as RecordingFileSystem
+      fs.entries.set(join(root, '.git'), { type: 'directory' })
+      fs.entries.set(join(root, 'pkg/AGENTS.md'), { type: 'file', content: 'agents rule' })
+      fs.entries.set(join(root, 'pkg/CLAUDE.md'), { type: 'file', content: 'claude rule' })
+      await ctx.plugin(ToolFs)
+      await mountAgentInstructionsPlugin(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      // AGENTS.md reaches the model through a read of its directory; CLAUDE.md
+      // then becomes unreadable before the write is attempted.
+      const read = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('read-before-claude-fails'),
+        name: 'read',
+        arguments: { file_path: join(root, 'pkg/AGENTS.md') },
+        agent,
+      })
+      expect(read.isError).toBe(false)
+      await syncAgentInstructions(ctx, agent)
+      const entered = claimInbox(agent, 'next-step')
+      expect(blocksText(entered[0]?.content)).toContain('agents rule')
+      for (const message of entered) {
+        const event = agent.session.append('user/message', message, { surfaceOp: 'append' })
+        ctx.emit('session/event', agent.session, event)
+      }
+      fs.throwOnStat.add(join(root, 'pkg/CLAUDE.md'))
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-with-partial-group'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+      expect(blocksText(result.content)).toContain('pkg/CLAUDE.md')
+    } finally {
+      vi.unstubAllEnvs()
+      await ctx.fiber.dispose()
+      await rm(dirname(root), { recursive: true, force: true })
+      await rm(dirname(home), { recursive: true, force: true })
+    }
+  })
+
+  it('holds a write when the byte budget truncates an applicable instruction file', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), `short head\n${'padding line\n'.repeat(200)}must run ttsc-graph before editing`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      // A budget that fits a heading and a prefix but not the whole file.
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const first = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-truncated-rules'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(first.isError).toBe(true)
+      expect(blocksText(first.content)).toContain('cannot confirm the workspace instructions')
+      const partialContext = first.additionalContexts?.find(message => message.source.kind === 'agent-instructions')
+      expect(partialContext?.source.kind === 'agent-instructions'
+        ? partialContext.source.changes[0]?.digest
+        : undefined).toBeUndefined()
+
+      // Entering the truncated text does not settle the file: the model never
+      // saw the tail, so the repeat stays held too.
+      for (const message of first.additionalContexts ?? []) {
+        const event = agent.session.append('user/message', message, { surfaceOp: 'append' })
+        ctx.emit('session/event', agent.session, event)
+      }
+      const second = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-truncated-rules-repeat'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(second.isError).toBe(true)
+      expect(blocksText(second.content)).toContain('cannot confirm the workspace instructions')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+
+  it('denies writes under an incomplete root baseline, including repeated attempts', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'src'), { recursive: true })
+      await write(join(root, 'AGENTS.md'), `opening rule\n${'padding rule\n'.repeat(200)}must run ttsc-graph before editing`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const baseline = baselineEvents(agent).at(-1)
+      const changes = baseline?.type === 'user/message'
+        && baseline.data.source.kind === 'agent-instructions'
+        ? baseline.data.source.changes : []
+      expect(changes).toEqual([{
+        action: 'set',
+        scope: sk('.', 'AGENTS.md'),
+        path: 'AGENTS.md',
+      }])
+
+      for (const attempt of ['first', 'second']) {
+        const result = await ctx.tools.execute({
+          signal: testToolSignal,
+          callId: ToolCallId(`write-under-truncated-root-${attempt}`),
+          name: 'write',
+          arguments: { file_path: join(root, 'src', 'out.txt'), content: 'x' },
+          agent,
+        })
+        expect(result.isError).toBe(true)
+        expect(blocksText(result.content)).toContain('cannot confirm the workspace instructions')
+        expect(existsSync(join(root, 'src', 'out.txt'))).toBe(false)
+      }
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts an unrelated sibling write without requiring cwd-only rules', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'apps', 'web'), { recursive: true })
+      await write(join(root, 'apps', 'api', 'AGENTS.md'), `api prefix\n${'api rule\n'.repeat(200)}`)
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 400 })
+      const agent = await stubAgent(join(root, 'apps', 'api'))
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-unrelated-sibling'),
+        name: 'write',
+        arguments: { file_path: join(root, 'apps', 'web', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('accepts byte-identical baseline candidates without requiring duplicate delivery', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await mkdir(join(root, 'src'), { recursive: true })
+      await write(join(root, 'AGENTS.md'), 'same instructions')
+      await write(join(root, 'CLAUDE.md'), 'same instructions')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-with-duplicate-baseline'),
+        name: 'write',
+        arguments: { file_path: join(root, 'src', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('runs downstream post-execute policies before adding ferried instructions', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), 'package-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536 })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+      let observed = 0
+      ctx.on('tools/post-execute', async (_exec, _result, _next) => {
+        observed += 1
+        return {
+          kind: 'block',
+          feedback: [{ type: 'text', text: 'downstream policy refused the result' }],
+          additionalContexts: [createUserMessage({
+            content: [{ type: 'text', text: 'downstream context' }],
+            source: { kind: 'other' },
+          })],
+        }
+      })
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-before-policy'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+
+      // The held write reaches post-execute, where the downstream policy decides
+      // the outcome; the ferried instructions join its context instead of
+      // replacing the decision with an unconditional accept.
+      expect(observed).toBe(1)
+      expect(result.isError).toBe(true)
+      expect(blocksText(result.content)).toContain('downstream policy refused the result')
+      const texts = (result.additionalContexts ?? []).map(message => blocksText(message.content))
+      expect(texts).toContain('downstream context')
+      expect(texts.join('\n')).toContain('package-only rule')
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
+  })
+
+  it('disables the hold-back when preEditProtection is false', async () => {
+    const root = await tempRepo()
+    const home = await tempRepo()
+    try {
+      await mkdir(join(root, '.git'), { recursive: true })
+      await write(join(root, 'pkg/AGENTS.md'), 'package-only rule')
+      const ctx = new Context()
+      provideWorkingDirectoryFixture(ctx)
+      pinHarnessHome(home)
+      await mountFileToolsAndAgentInstructions(ctx, { maxBytes: 65536, preEditProtection: false })
+      const agent = await stubAgent(root)
+      await composeBaselinePrefix(ctx, agent)
+
+      const result = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: ToolCallId('write-unprotected'),
+        name: 'write',
+        arguments: { file_path: join(root, 'pkg', 'out.txt'), content: 'x' },
+        agent,
+      })
+      expect(result.isError).toBe(false)
+    } finally {
+      vi.unstubAllEnvs()
+      await rm(root, { recursive: true, force: true })
+      await rm(home, { recursive: true, force: true })
+    }
   })
 })

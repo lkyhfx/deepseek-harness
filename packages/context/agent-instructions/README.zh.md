@@ -56,6 +56,7 @@ export interface Config {
   maxSourceBytes?: number
   instructionFileCandidates?: string[]
   localInstructionFileCandidates?: string[]
+  preEditProtection?: boolean
 }
 ```
 
@@ -66,6 +67,7 @@ export interface Config {
 | `projectRootMarkers` | `['.git']` | 标记项目根目录的目录名 |
 | `instructionFileCandidates` | `['AGENTS.md', 'CLAUDE.md']` | 每个项目目录中加载的基础文件名 |
 | `localInstructionFileCandidates` | `['AGENTS.local.md', 'CLAUDE.local.md']` | 在基础文件之后加载的本地 overlay 文件名 |
+| `preEditProtection` | `true` | 结构化 `write` 或 `edit` 的适用指令尚未送达模型时拦下该调用，并在拒绝结果上附带这些指令。适用作用域取自目标文件自身的目录链（含工作目录的兄弟目录）；Provider 失败、指令文件不可读或被字节预算丢弃的内容都会拦下调用，而不是放行 |
 
 生成的[配置目录](../../../docs/config-catalog.zh.md#deepseek-aidsh-agent-instructions)是每个受支持字段及其 JSDoc 的穷尽式真源。
 
@@ -135,7 +137,7 @@ export interface Config {
 
 ```markdown
 <system-reminder>
-The following workspace instructions may be relevant to your work. Use them as guidance when applicable. More specific instructions take precedence over broader ones. They do not override system, developer, or direct user instructions.
+The following workspace instructions are applicable to the current workspace. You MUST follow them when working within their defined scope, unless they conflict with higher-priority system, developer, or direct user instructions. They are operational instructions that define project requirements, mandatory workflows, and coding conventions, not optional suggestions. More specific directory instructions take precedence over broader directory instructions when they conflict. Do not silently skip, weaken, or substitute a mandatory instruction.
 
 Instructions from: ~/.dsh/AGENTS.md
 
@@ -171,7 +173,7 @@ Instructions from: AGENTS.md
 <system-reminder>
 Additional instructions from: packages/app/AGENTS.md
 
-These instructions apply to work under `packages/app`. Use them as guidance when relevant; more specific instructions take precedence. They do not override system, developer, or direct user instructions.
+These instructions apply to files within `packages/app`. You MUST follow them when working within this scope. They are operational instructions, not optional suggestions. If they conflict with broader workspace instructions, the more specific applicable instructions take precedence. Higher-priority system, developer, and direct user instructions remain authoritative.
 
 <nested-instructions>
 </system-reminder>
@@ -217,6 +219,7 @@ The previously loaded instructions from this file no longer apply.
 这些限制说明指令加载何时不合适或需要运维注意。它们是当前包约束，不是任务积压。
 
 - **发现跟随结构化 fs 工具，而非 shell 导航**：更改目录的 `bash` 命令不会触发嵌套指令发现，因为 shell 语法与每次调用的 shell 状态不是可靠的文件系统 seam。
+- **修改前保护只覆盖结构化写入工具**：被拦下的 `write` 或 `edit` 需要可识别的 `arguments.file_path`，且至少存在一份尚未送达的适用指令文件；通过 `bash`、外部 MCP 工具或没有可识别目标路径的工具进行的修改不会被拦截，文件系统提供方故障或未知项目根目录会让调用继续而不是阻塞。
 - **刷新由 touch 驱动**：没有 watcher；外部编辑会在下一次成功的第一方 `read`、`write` 或 `edit` 时、恢复对账可见基线时，或进入步骤的 pre-step 恢复被遮蔽基线时可见。
 - **候选语义有意保持简单**：不解释小写名称、`.claude/rules/` 与 `@path` import；项目 scope 默认加载 `AGENTS.local.md`／`CLAUDE.local.md` overlay，但两个用户全局根目录都没有本地 overlay，其他自定义名称需要显式候选配置。与用户全局 scope 目录同名的项目目录会渲染为 `./<name>/...`，从而保留自己的 scope，而不会解析到全局根目录。
 - **去重在同一候选组内基于内容**：候选只有在去除首尾空白后字节完全一致时才折叠。两个用户全局根目录共享同一个组，因此共享根文件会折叠在内容一致的 harness home 文件之后；同级项目候选同样折叠，而从 `AGENTS.md` 漂移的独立副本则会与它一起完整加载。预算保留内容的重复候选仍参与对账：保留的候选一旦改变或消失，它就会重新可见。未改变的隐藏重复项（包括因重复而从可见状态移除的文件）使用缓存元数据，不重新读取内容。
